@@ -25,6 +25,12 @@ function createHarness() {
 	const dispatchHandlers = new Map<string, (args: unknown[]) => unknown>();
 	let nextId = 1;
 
+	// Pre-seed common test target ids as peers so target validation passes.
+	// Tests that exercise validation explicitly seed/omit targets themselves.
+	for (const id of ["grant", "g", "p", "x", "mom", "peer-grant", "peer-x"]) {
+		objects.set(id, { id, typeKey: "peer", fields: {}, deleted: false });
+	}
+
 	function actorFor(id: string) {
 		return {
 			setField: async (key: string, valueJson: string) => {
@@ -101,6 +107,11 @@ function createHarness() {
 		ctx, objects, dispatchCalls,
 		onDispatch(prefix: string, action: string, fn: (args: unknown[]) => unknown) {
 			dispatchHandlers.set(`${prefix}::${action}`, fn);
+		},
+		/** Register an object so target validation accepts it. Default typeKey=peer. */
+		seedTarget(id: string, typeKey: "peer" | "agent" = "peer") {
+			objects.set(id, { id, typeKey, fields: {}, deleted: false });
+			return id;
 		},
 	};
 }
@@ -205,9 +216,9 @@ describe("list / get / cancel", () => {
 		const cancel = remindProgram.actor!.actions!.cancel;
 		const list = remindProgram.actor!.actions!.list;
 
-		const a = await schedule(h.ctx, { channel: "discord", target: "grant", fire_at: "+1h", payload: {}, created_by: "grant" }) as { id: string };
-		const b = await schedule(h.ctx, { channel: "email", target: "mom@ex.com", fire_at: "+2h", payload: {}, created_by: "grant" }) as { id: string };
-		await schedule(h.ctx, { channel: "discord", target: "mom", fire_at: "+3h", payload: {}, created_by: "mom" });
+		const a = await schedule(h.ctx, { channel: "discord", target: "grant", fire_at: "+1h", payload: { message: "hi" }, created_by: "grant" }) as { id: string };
+		const b = await schedule(h.ctx, { channel: "email", target: "mom@ex.com", fire_at: "+2h", payload: { subject: "hi", body: "hi" }, created_by: "grant" }) as { id: string };
+		await schedule(h.ctx, { channel: "discord", target: "mom", fire_at: "+3h", payload: { message: "hi" }, created_by: "mom" });
 		await cancel(h.ctx, a.id);
 
 		const pending = await list(h.ctx, { status: "pending" }) as Array<{ id: string }>;
@@ -240,7 +251,7 @@ describe("list / get / cancel", () => {
 		const h = createHarness();
 		const schedule = remindProgram.actor!.actions!.schedule;
 		const cancel = remindProgram.actor!.actions!.cancel;
-		const r = await schedule(h.ctx, { channel: "discord", target: "x", fire_at: "+1h", payload: {} }) as { id: string };
+		const r = await schedule(h.ctx, { channel: "discord", target: "x", fire_at: "+1h", payload: { message: "x" } }) as { id: string };
 		const result1 = await cancel(h.ctx, r.id) as { ok: boolean; was: string };
 		assert.equal(result1.ok, true);
 		assert.equal(result1.was, "pending");
@@ -406,7 +417,7 @@ describe("runSchedulerTick", () => {
 		h.onDispatch("/discord", "send", () => ({ channel_id: "c", message_ids: [] }));
 
 		const cancelled = await schedule(h.ctx, {
-			channel: "discord", target: "g", fire_at: Date.now() - 1000, payload: {},
+			channel: "discord", target: "g", fire_at: Date.now() - 1000, payload: { message: "x" },
 		}) as { id: string };
 		await cancel(h.ctx, cancelled.id);
 
@@ -444,5 +455,213 @@ describe("runSchedulerTick", () => {
 describe("CHANNELS", () => {
 	it("exposes the supported channels", () => {
 		assert.deepEqual([...CHANNELS].sort(), ["discord", "email", "agent_compose"].sort());
+	});
+});
+
+
+// ── normalizePayload ─────────────────────────────────────────────
+//
+// Models routinely pass `payload` as a JSON-encoded string instead of an
+// object even though the schema declares `type: object`. Older /remind
+// schedule then JSON.stringify'd that string a second time, so the stored
+// field was double-encoded and parsing on read returned `{}` — every
+// fired reminder delivered the empty fallback. These tests pin the fix.
+
+describe("normalizePayload", () => {
+	it("passes plain objects through", () => {
+		assert.deepEqual(__test.normalizePayload({ prompt: "hi" }), { prompt: "hi" });
+		assert.deepEqual(__test.normalizePayload({}), {});
+	});
+
+	it("parses JSON-encoded object strings", () => {
+		assert.deepEqual(__test.normalizePayload('{"prompt":"hi"}'), { prompt: "hi" });
+		assert.deepEqual(__test.normalizePayload('{}'), {});
+	});
+
+	it("treats null/undefined/empty string as empty payload", () => {
+		assert.deepEqual(__test.normalizePayload(null), {});
+		assert.deepEqual(__test.normalizePayload(undefined), {});
+		assert.deepEqual(__test.normalizePayload(""), {});
+		assert.deepEqual(__test.normalizePayload("   "), {});
+	});
+
+	it("rejects strings that aren't valid JSON", () => {
+		assert.throws(() => __test.normalizePayload("not json"), /not valid JSON/);
+	});
+
+	it("rejects JSON that decodes to a non-object (number, array, string)", () => {
+		assert.throws(() => __test.normalizePayload('"prompt"'), /must encode a JSON object/);
+		assert.throws(() => __test.normalizePayload("42"), /must encode a JSON object/);
+		assert.throws(() => __test.normalizePayload("[1,2,3]"), /must encode a JSON object/);
+	});
+
+	it("rejects non-object, non-string types outright", () => {
+		assert.throws(() => __test.normalizePayload(42), /must be an object or a JSON-encoded object string/);
+		assert.throws(() => __test.normalizePayload(true), /must be an object or a JSON-encoded object string/);
+		assert.throws(() => __test.normalizePayload([1, 2, 3]), /must be an object or a JSON-encoded object string/);
+	});
+});
+
+// ── parsePayloadField ────────────────────────────────────────────
+//
+// Defensive read recovers reminders written by the buggy old schedule path.
+
+describe("parsePayloadField", () => {
+	it("reads a clean JSON object string", () => {
+		assert.deepEqual(__test.parsePayloadField('{"prompt":"hi"}'), { prompt: "hi" });
+	});
+
+	it("unwraps a legacy double-encoded payload (string-of-string-of-object)", () => {
+		// What the old schedule path stored: JSON.stringify of an already-stringified payload.
+		const legacy = JSON.stringify('{"prompt":"hi"}');
+		assert.deepEqual(__test.parsePayloadField(legacy), { prompt: "hi" });
+	});
+
+	it("returns {} on garbage input rather than throwing", () => {
+		assert.deepEqual(__test.parsePayloadField(""), {});
+		assert.deepEqual(__test.parsePayloadField("not json"), {});
+		assert.deepEqual(__test.parsePayloadField('"a string"'), {});
+	});
+});
+
+// ── validatePayloadForChannel ────────────────────────────────────
+//
+// Per-channel contracts catch payload mistakes at schedule time so the
+// model can self-correct, instead of producing a fired reminder that
+// delivers the empty `Follow up: {}` fallback at dispatch time.
+
+describe("validatePayloadForChannel", () => {
+	it("agent_compose requires a non-empty prompt string", () => {
+		__test.validatePayloadForChannel("agent_compose", { prompt: "hi" });
+		assert.throws(() => __test.validatePayloadForChannel("agent_compose", {}), /requires a non-empty 'prompt'/);
+		assert.throws(() => __test.validatePayloadForChannel("agent_compose", { prompt: "" }), /requires a non-empty 'prompt'/);
+		assert.throws(() => __test.validatePayloadForChannel("agent_compose", { prompt: "   " }), /requires a non-empty 'prompt'/);
+		assert.throws(() => __test.validatePayloadForChannel("agent_compose", { prompt: 42 as unknown as string }), /requires a non-empty 'prompt'/);
+	});
+
+	it("discord requires a non-empty message string", () => {
+		__test.validatePayloadForChannel("discord", { message: "hi" });
+		assert.throws(() => __test.validatePayloadForChannel("discord", {}), /requires a non-empty 'message'/);
+		assert.throws(() => __test.validatePayloadForChannel("discord", { message: "" }), /requires a non-empty 'message'/);
+	});
+
+	it("email requires both subject and body (or message as body)", () => {
+		__test.validatePayloadForChannel("email", { subject: "x", body: "y" });
+		__test.validatePayloadForChannel("email", { subject: "x", message: "y" });
+		assert.throws(() => __test.validatePayloadForChannel("email", {}), /requires a non-empty 'subject'/);
+		assert.throws(() => __test.validatePayloadForChannel("email", { subject: "x" }), /requires a non-empty 'body'/);
+	});
+});
+
+// ── validateTarget + doSchedule integration ─────────────────────
+//
+// Targets that aren't peer/agent objects are the most damaging input the
+// scheduler accepts: the dispatcher then routes to /holdfast.ingest using
+// the target as a peer id, the from-tag becomes garbage, and the agent
+// can't find the sender to reply to. Reject early.
+
+describe("target validation", () => {
+	it("rejects targets that don't resolve to any object", async () => {
+		const h = createHarness();
+		const schedule = remindProgram.actor!.actions!.schedule;
+		await assert.rejects(
+			() => schedule(h.ctx, {
+				channel: "discord", target: "not-a-real-id",
+				fire_at: "+1m", payload: { message: "x" },
+			}),
+			/target object not found/,
+		);
+	});
+
+	it("rejects targets that resolve to a program object (the Graice mis-pick)", async () => {
+		const h = createHarness();
+		// Mimic the actual Graice bug: agent picked the /agent program object's id
+		// as `target` and it ended up firing reminders into nothing useful.
+		h.objects.set("prog-agent", { id: "prog-agent", typeKey: "program", fields: {}, deleted: false });
+		const schedule = remindProgram.actor!.actions!.schedule;
+		await assert.rejects(
+			() => schedule(h.ctx, {
+				channel: "agent_compose", target: "prog-agent",
+				fire_at: "+1m", payload: { prompt: "do thing" },
+			}),
+			/typeKey='program'/,
+		);
+	});
+
+	it("accepts a peer target for discord", async () => {
+		const h = createHarness();
+		h.seedTarget("alice", "peer");
+		const schedule = remindProgram.actor!.actions!.schedule;
+		const r = await schedule(h.ctx, {
+			channel: "discord", target: "alice",
+			fire_at: "+1m", payload: { message: "hi" },
+		}) as { id: string };
+		assert.ok(r.id);
+	});
+
+	it("accepts an agent target for agent_compose (self-scheduled prompts)", async () => {
+		const h = createHarness();
+		h.seedTarget("my-agent", "agent");
+		const schedule = remindProgram.actor!.actions!.schedule;
+		const r = await schedule(h.ctx, {
+			channel: "agent_compose", target: "my-agent",
+			fire_at: "+1m", payload: { prompt: "think about dinner" },
+		}) as { id: string };
+		assert.ok(r.id);
+	});
+
+	it("email targets must contain @ but skip the Glon-id existence check", async () => {
+		const h = createHarness();
+		const schedule = remindProgram.actor!.actions!.schedule;
+		const r = await schedule(h.ctx, {
+			channel: "email", target: "alice@example.com",
+			fire_at: "+1m", payload: { subject: "hi", body: "hello" },
+		}) as { id: string };
+		assert.ok(r.id);
+		await assert.rejects(
+			() => schedule(h.ctx, {
+				channel: "email", target: "not-an-email",
+				fire_at: "+1m", payload: { subject: "hi", body: "hi" },
+			}),
+			/email target must be an email address/,
+		);
+	});
+});
+
+// ── doSchedule + string payload (the original Graice bug) ────────
+//
+// End-to-end check that a model passing payload as a JSON string still
+// produces a reminder whose stored payload round-trips to a real object.
+
+describe("doSchedule with string payload (legacy model behaviour)", () => {
+	it("accepts payload as a JSON string and stores a clean payload object", async () => {
+		const h = createHarness();
+		const schedule = remindProgram.actor!.actions!.schedule;
+		const r = await schedule(h.ctx, {
+			channel: "agent_compose", target: "grant",
+			fire_at: "+1m",
+			// What Graice was actually sending — payload as a JSON string.
+			payload: '{"prompt":"check chrome sessions"}' as unknown as Record<string, unknown>,
+		}) as { id: string };
+
+		const obj = h.objects.get(r.id)!;
+		const storedPayload = JSON.parse(obj.fields.payload.stringValue);
+		assert.deepEqual(storedPayload, { prompt: "check chrome sessions" });
+		// And the dispatcher's view of the record gets the prompt string out.
+		const rec = __test.recordFromState(r.id, obj.fields)!;
+		assert.equal(rec.payload.prompt, "check chrome sessions");
+	});
+
+	it("rejects a string payload that doesn't decode to an object", async () => {
+		const h = createHarness();
+		const schedule = remindProgram.actor!.actions!.schedule;
+		await assert.rejects(
+			() => schedule(h.ctx, {
+				channel: "discord", target: "grant",
+				fire_at: "+1m",
+				payload: '"just a string"' as unknown as Record<string, unknown>,
+			}),
+			/must encode a JSON object/,
+		);
 	});
 });

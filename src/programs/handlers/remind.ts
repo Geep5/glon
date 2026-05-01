@@ -94,11 +94,7 @@ function recordFromState(id: string, fields: Record<string, any>): ReminderRecor
 	const target = extractString(fields?.target);
 	if (fire_at_ms === undefined || !channel || !target) return null;
 	const payloadStr = extractString(fields?.payload) ?? "{}";
-	let payload: Record<string, unknown> = {};
-	try {
-		const parsed = JSON.parse(payloadStr);
-		if (parsed && typeof parsed === "object") payload = parsed;
-	} catch { /* ignore */ }
+	const payload = parsePayloadField(payloadStr);
 
 	return {
 		id,
@@ -132,13 +128,126 @@ function parseFireAt(input: unknown): number {
 	throw new Error("fire_at must be an ISO date string or a number (epoch ms)");
 }
 
+// ── Payload + target validation ──────────────────────────────────
+//
+// Models routinely pass `payload` as a JSON-encoded string instead of an
+// object, even when the schema says `type: object`. We accept both shapes,
+// store the canonical encoding, and reject anything that isn't an object
+// at heart so legacy double-encoded payloads can't quietly slip through.
+
+/** Normalize a schedule payload from a model. Accepts an object or a
+ *  JSON-string-of-an-object. Throws on garbage so the model self-corrects
+ *  on the next iteration instead of writing a useless reminder. */
+function normalizePayload(raw: unknown): Record<string, unknown> {
+	if (raw === null || raw === undefined) return {};
+	if (typeof raw === "object" && !Array.isArray(raw)) {
+		return raw as Record<string, unknown>;
+	}
+	if (typeof raw === "string") {
+		const trimmed = raw.trim();
+		if (trimmed === "") return {};
+		let parsed: unknown;
+		try { parsed = JSON.parse(trimmed); }
+		catch (err: any) {
+			throw new Error(`payload string is not valid JSON: ${err?.message ?? err}`);
+		}
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			return parsed as Record<string, unknown>;
+		}
+		throw new Error(`payload string must encode a JSON object, got ${typeof parsed}`);
+	}
+	throw new Error(`payload must be an object or a JSON-encoded object string, got ${typeof raw}`);
+}
+
+/** Defensive read for stored payload strings.
+ *  Recovers legacy double-encoded payloads (a bug shipped in earlier
+ *  /remind schedule that JSON.stringified a payload that was already a
+ *  JSON string). Returns {} on any unparseable input rather than throwing,
+ *  so a corrupted reminder still returns a record callers can introspect. */
+function parsePayloadField(payloadStr: string): Record<string, unknown> {
+	if (!payloadStr) return {};
+	try {
+		let parsed: unknown = JSON.parse(payloadStr);
+		let hops = 0;
+		while (typeof parsed === "string" && hops < 4) {
+			try { parsed = JSON.parse(parsed); } catch { break; }
+			hops++;
+		}
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			return parsed as Record<string, unknown>;
+		}
+	} catch { /* ignore */ }
+	return {};
+}
+
+/** Per-channel payload contract. Reminders that don't satisfy the contract
+ *  for their channel would either fail at dispatch (silently for sent
+ *  reminders) or, worse, deliver an empty fallback message. Fail at
+ *  schedule time instead. */
+function validatePayloadForChannel(channel: Channel, payload: Record<string, unknown>): void {
+	switch (channel) {
+		case "agent_compose": {
+			const prompt = payload.prompt;
+			if (typeof prompt !== "string" || !prompt.trim()) {
+				throw new Error("agent_compose payload requires a non-empty 'prompt' string");
+			}
+			return;
+		}
+		case "discord": {
+			const message = payload.message;
+			if (typeof message !== "string" || !message.trim()) {
+				throw new Error("discord payload requires a non-empty 'message' string");
+			}
+			return;
+		}
+		case "email": {
+			if (typeof payload.subject !== "string" || !(payload.subject as string).trim()) {
+				throw new Error("email payload requires a non-empty 'subject' string");
+			}
+			const body = payload.body ?? payload.message;
+			if (typeof body !== "string" || !body.trim()) {
+				throw new Error("email payload requires a non-empty 'body' (or 'message') string");
+			}
+			return;
+		}
+	}
+}
+
+/** Validate the `target` field for a given channel. For Glon-id channels
+ *  (discord, agent_compose) the target must resolve to a peer or agent
+ *  object — picking a program/reminder/etc. id is a common LLM mis-pick
+ *  that produces self-talk loops where the harness can't recognise the
+ *  sender. */
+async function validateTarget(channel: Channel, target: string, ctx: ProgramContext): Promise<void> {
+	if (channel === "email") {
+		if (!target.includes("@") || target.length < 3) {
+			throw new Error(`email target must be an email address, got '${target}'`);
+		}
+		return;
+	}
+	// discord + agent_compose: target must be a Glon peer or agent.
+	const store = ctx.store as any;
+	const obj = await store.get(target);
+	if (!obj || obj.deleted) {
+		throw new Error(`target object not found: ${target}`);
+	}
+	if (obj.typeKey !== "peer" && obj.typeKey !== "agent") {
+		throw new Error(
+			`target must be a peer or agent (got typeKey='${obj.typeKey}'). ` +
+			`Use peer_list to find a recipient peer id, or your own agent id for self-scheduled prompts.`,
+		);
+	}
+}
+
 // ── Core operations ──────────────────────────────────────────────
 
 export interface ScheduleInput {
 	channel: Channel | string;
 	target: string;
 	fire_at: string | number;
-	payload?: Record<string, unknown>;
+	/** Channel-specific data. Object form preferred; JSON-string is accepted for
+	 *  models that ignore the `type: object` schema and stringify the payload. */
+	payload?: Record<string, unknown> | string;
 	created_by?: string;
 	note?: string;
 }
@@ -149,13 +258,16 @@ async function doSchedule(input: ScheduleInput, ctx: ProgramContext): Promise<{ 
 	if (!CHANNELS.includes(input.channel as Channel)) {
 		throw new Error(`schedule: unknown channel '${input.channel}' (must be one of: ${CHANNELS.join(", ")})`);
 	}
+	const channel = input.channel as Channel;
 	const fire_at_ms = parseFireAt(input.fire_at);
-	const payload = input.payload ?? {};
+	const payload = normalizePayload(input.payload);
+	validatePayloadForChannel(channel, payload);
+	await validateTarget(channel, input.target, ctx);
 
 	const store = ctx.store as any;
 	const fields: Record<string, unknown> = {
 		fire_at_ms: ctx.intVal(fire_at_ms),
-		channel: ctx.stringVal(input.channel),
+		channel: ctx.stringVal(channel),
 		target: ctx.stringVal(input.target),
 		payload: ctx.stringVal(JSON.stringify(payload)),
 		created_by: ctx.stringVal(input.created_by ?? "system"),
@@ -537,6 +649,10 @@ export const __test = {
 	runSchedulerTick,
 	parseFireAt,
 	recordFromState,
+	normalizePayload,
+	parsePayloadField,
+	validatePayloadForChannel,
+	validateTarget,
 	/** Override scheduler retry delay (tests). Reset by passing undefined. */
 	setRetryDelayMs(ms: number | undefined) {
 		schedulerRetryDelayMs = ms ?? DEFAULT_SCHEDULER_RETRY_DELAY_MS;
