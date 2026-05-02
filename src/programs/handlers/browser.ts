@@ -1,16 +1,19 @@
-// Browser automation — shell cheatsheet for `agent-browser`.
+// Browser automation — shell cheatsheet for `browser-use`.
 //
-// agent-browser is a Rust CLI (vercel-labs/agent-browser) that drives Chrome
-// via the DevTools Protocol with a persistent local daemon. It already
-// solves auth persistence (sessions, profiles, state files), accessibility-
-// based element refs (`@e1`, `@e2`), batch execution, and screenshot/PDF
-// export. Anything we'd wrap in a Glon program would be 90% wheel-recreation,
-// so the agent talks to it via shell_exec and this program is just a REPL
-// cheatsheet matching what the system prompt teaches.
+// browser-use is a Python CLI (browser-use.com) that drives Chrome via the
+// DevTools Protocol with a persistent local daemon. It already solves auth
+// persistence (--profile attaches to the principal's real Chrome profile,
+// preserving every existing login), accessibility-based element refs
+// ([10], [34], ...), batch execution, and screenshot/PDF export. Anything
+// we'd wrap in a Glon program would be 90% wheel-recreation, so the agent
+// talks to it via shell_exec and this program is just a REPL cheatsheet
+// matching what the system prompt teaches.
 //
-// Install: `npm install -g agent-browser`. Existing system Chrome is
-// detected automatically; running `agent-browser install` to download
-// Chrome for Testing is optional.
+// Install (required if you want any agent on this harness to browse the web):
+//   pipx install browser-use         # cleanest; uses pipx's isolated venv
+//   browser-use install              # downloads Chromium + system deps
+//   browser-use doctor               # verifies installation
+// Or via pip --user: `pip install --user browser-use`.
 
 import type { ProgramDef, ProgramContext } from "../runtime.js";
 
@@ -24,27 +27,32 @@ const handler = async (_cmd: string, _args: string[], ctx: ProgramContext) => {
 	print([
 		bold("  Browser automation") + dim(" — drive Chrome from shell. No actor."),
 		"",
-		dim("  CLI: agent-browser (Rust). doctor: agent-browser doctor"),
-		dim("  Each agent should pin --session <name> so state persists across calls."),
+		dim("  CLI: browser-use (Python). doctor: browser-use doctor"),
+		dim("  Install: pipx install browser-use && browser-use install"),
 		"",
-		dim("  Standard AI flow (snapshot → @e refs → action):"),
-		`    ${cyan("agent-browser --session <name> open <URL>")}`,
-		`    ${cyan("agent-browser --session <name> snapshot")}     ${dim("# tree with @e1, @e2 refs")}`,
-		`    ${cyan("agent-browser --session <name> click @e3")}`,
-		`    ${cyan("agent-browser --session <name> fill @e5 \"value\"")}`,
-		`    ${cyan("agent-browser --session <name> screenshot /tmp/r.png")}`,
-		`    ${cyan("agent-browser --session <name> close")}        ${dim("# only when truly done")}`,
+		dim("  Pin --session <name> per workflow so cookies + page state persist."),
+		dim("  Add --profile to use the principal's REAL Chrome profile (skips login walls):"),
+		`    ${cyan("browser-use --profile --session graice open https://discord.com/app")}`,
+		`    ${cyan("browser-use --profile --session graice state")}`,
 		"",
-		dim("  Multi-step bundle (avoid per-command daemon round-trip):"),
-		`    ${cyan("agent-browser --session <name> batch \\")}`,
-		`    ${cyan("  \"open <URL>\" \"snapshot\" \"click @e1\" \"screenshot /tmp/r.png\"")}`,
+		dim("  Standard flow once a session is open (state returns elements as [N] refs):"),
+		`    ${cyan("browser-use --session <name> state")}              ${dim("# tree of elements with [N] refs")}`,
+		`    ${cyan("browser-use --session <name> click 10")}           ${dim("# click element [10]")}`,
+		`    ${cyan("browser-use --session <name> input 12 \"value\"")}  ${dim("# type into element [12]")}`,
+		`    ${cyan("browser-use --session <name> screenshot /tmp/r.png")}`,
+		`    ${cyan("browser-use --session <name> extract \"goal\"")}    ${dim("# LLM-assisted data extraction")}`,
+		`    ${cyan("browser-use --session <name> close")}              ${dim("# only when truly done")}`,
 		"",
-		dim("  Auth shortcut — import the principal's live Chrome login:"),
-		`    ${cyan("agent-browser --auto-connect state save /tmp/auth.json")}`,
-		`    ${cyan("agent-browser --session <name> --state /tmp/auth.json open <URL>")}`,
+		dim("  Other useful subcommands:"),
+		`    ${cyan("browser-use sessions")}                            ${dim("# list live sessions")}`,
+		`    ${cyan("browser-use cookies export <path>")}               ${dim("# save auth state to a file")}`,
+		`    ${cyan("browser-use cookies import <path>")}               ${dim("# load auth state from a file")}`,
 		"",
-		dim("  Full reference: agent-browser --help, agent-browser <cmd> --help"),
-		dim("  Project: https://github.com/vercel-labs/agent-browser"),
+		dim("  Showing the principal something visual: save with screenshot /tmp/<name>.png,"),
+		dim("  then surface the path in your reply (or xdg-open the file on a desktop)."),
+		"",
+		dim("  Full reference: browser-use --help, browser-use <cmd> --help"),
+		dim("  Project: https://github.com/browser-use/browser-use"),
 	].join("\n"));
 };
 

@@ -39,12 +39,18 @@ The kernel knows nothing about LLMs. The fact that `/agent` exists at the progra
 **Prerequisites**
 - Node 20+ (the dev server uses the built-in `node:sqlite`).
 - For LLM agents: either an Anthropic API key (`ANTHROPIC_API_KEY`) or a Claude Pro/Max plan (set up via `/auth login anthropic`). Discord bot token if you want the bridge.
+- For agents that browse the web: [`browser-use`](https://github.com/browser-use/browser-use) on `$PATH`. The default Holdfast system prompt teaches `browser-use --profile` as the canonical browser path; without it installed, any browser task an agent attempts will fail. Install once on the host machine:
 
 **Install**
 ```bash
 git clone https://github.com/Geep5/glon.git
 cd glon && npm install
 cp .env.example .env        # fill in secrets (see sections below)
+
+# If any agent on this harness will browse the web, also install browser-use:
+pipx install browser-use    # or: pip install --user browser-use
+browser-use install         # downloads Chromium + system deps
+browser-use doctor          # verifies the install
 ```
 
 **Run**
