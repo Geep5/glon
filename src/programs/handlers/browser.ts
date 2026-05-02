@@ -1,19 +1,28 @@
-// Browser automation — shell cheatsheet for `browser-use`.
+// Browser automation — shell cheatsheet for Skyvern.
 //
-// browser-use is a Python CLI (browser-use.com) that drives Chrome via the
-// DevTools Protocol with a persistent local daemon. It already solves auth
-// persistence (--profile attaches to the principal's real Chrome profile,
-// preserving every existing login), accessibility-based element refs
-// ([10], [34], ...), batch execution, and screenshot/PDF export. Anything
-// we'd wrap in a Glon program would be 90% wheel-recreation, so the agent
-// talks to it via shell_exec and this program is just a REPL cheatsheet
-// matching what the system prompt teaches.
+// Skyvern (https://github.com/Skyvern-AI/skyvern) is a Python service that
+// drives Chrome via Playwright with a vision-LLM swarm on top, planning and
+// executing actions from natural-language prompts. We use it instead of a
+// thin DevTools CLI because reliability on real-world sites is much higher:
+// no per-site selectors to babysit, robust to layout changes, handles
+// CAPTCHAs / login walls / multi-step flows out of the box.
 //
-// Install (required if you want any agent on this harness to browse the web):
-//   pipx install browser-use         # cleanest; uses pipx's isolated venv
-//   browser-use install              # downloads Chromium + system deps
-//   browser-use doctor               # verifies installation
-// Or via pip --user: `pip install --user browser-use`.
+// Skyvern is a long-running local server (default :8000), not a one-shot CLI:
+// the operator starts it once with `skyvern run server` (or `skyvern run all`
+// for server + UI on :8080), and agents drive it via HTTP.
+//
+// Install (required if any agent on this harness will browse the web):
+//   pip install skyvern         # or: pipx install skyvern
+//   skyvern quickstart          # initialises ~/.skyvern (DB, credentials, .env)
+//   skyvern run server          # long-running; binds 127.0.0.1:8000
+// Configure an LLM key in `~/.skyvern/.env` (LLM_KEY=ANTHROPIC + ANTHROPIC_API_KEY=...
+// or LLM_KEY=OPENAI_GPT4O + OPENAI_API_KEY=...). Local API key is generated
+// at quickstart time and lives in the same .env; export it so curl can use it.
+//
+// To use the principal's REAL Chrome (so Skyvern inherits all existing logins),
+// enable Chrome remote debugging once and set BROWSER_TYPE=cdp-connect plus
+// BROWSER_REMOTE_DEBUGGING_URL=http://127.0.0.1:9222 in ~/.skyvern/.env, then
+// restart the server. See https://www.skyvern.com/docs/optimization/browser-tunneling.
 
 import type { ProgramDef, ProgramContext } from "../runtime.js";
 
@@ -25,34 +34,65 @@ const cyan = (s: string) => `${CYAN}${s}${RESET}`;
 const handler = async (_cmd: string, _args: string[], ctx: ProgramContext) => {
 	const { print } = ctx;
 	print([
-		bold("  Browser automation") + dim(" — drive Chrome from shell. No actor."),
+		bold("  Browser automation") + dim(" — drive Chrome via Skyvern. No actor."),
 		"",
-		dim("  CLI: browser-use (Python). doctor: browser-use doctor"),
-		dim("  Install: pipx install browser-use && browser-use install"),
+		dim("  Service: Skyvern (https://github.com/Skyvern-AI/skyvern), local on :8000"),
+		dim("  Install: pip install skyvern && skyvern quickstart && skyvern run server &"),
+		dim("  Status:  skyvern status   |   skyvern stop all"),
 		"",
-		dim("  Pin --session <name> per workflow so cookies + page state persist."),
-		dim("  Add --profile to use the principal's REAL Chrome profile (skips login walls):"),
-		`    ${cyan("browser-use --profile --session graice open https://discord.com/app")}`,
-		`    ${cyan("browser-use --profile --session graice state")}`,
+		dim("  Auth: skyvern quickstart writes credentials to ~/.skyvern/.env"),
+		dim("  (LLM key + a local API key). Export the local API key for curl:"),
+		`    ${cyan("export SKYVERN_API_KEY=$(grep SKYVERN_API_KEY ~/.skyvern/.env | cut -d= -f2)")}`,
 		"",
-		dim("  Standard flow once a session is open (state returns elements as [N] refs):"),
-		`    ${cyan("browser-use --session <name> state")}              ${dim("# tree of elements with [N] refs")}`,
-		`    ${cyan("browser-use --session <name> click 10")}           ${dim("# click element [10]")}`,
-		`    ${cyan("browser-use --session <name> input 12 \"value\"")}  ${dim("# type into element [12]")}`,
-		`    ${cyan("browser-use --session <name> screenshot /tmp/r.png")}`,
-		`    ${cyan("browser-use --session <name> extract \"goal\"")}    ${dim("# LLM-assisted data extraction")}`,
-		`    ${cyan("browser-use --session <name> close")}              ${dim("# only when truly done")}`,
+		dim("  One-shot task (submit + poll + extract result, single shell call):"),
+		`    ${cyan("RUN=$(curl -sS -X POST http://localhost:8000/v1/run/tasks \\")}`,
+		`    ${cyan("  -H \"Content-Type: application/json\" -H \"x-api-key: $SKYVERN_API_KEY\" \\")}`,
+		`    ${cyan("  -d '{\"prompt\":\"<goal>\",\"url\":\"<URL>\",\"engine\":\"skyvern-2.0\",\"max_steps\":15}' \\")}`,
+		`    ${cyan("  | jq -r '.run_id // .task_id'); \\")}`,
+		`    ${cyan("until S=$(curl -sS -H \"x-api-key: $SKYVERN_API_KEY\" \\")}`,
+		`    ${cyan("  http://localhost:8000/v1/runs/$RUN | jq -r '.status'); \\")}`,
+		`    ${cyan("[ \"$S\" = completed ] || [ \"$S\" = failed ] || [ \"$S\" = terminated ]; \\")}`,
+		`    ${cyan("do sleep 5; done; \\")}`,
+		`    ${cyan("curl -sS -H \"x-api-key: $SKYVERN_API_KEY\" \\")}`,
+		`    ${cyan("  http://localhost:8000/v1/runs/$RUN | jq .")}`,
 		"",
-		dim("  Other useful subcommands:"),
-		`    ${cyan("browser-use sessions")}                            ${dim("# list live sessions")}`,
-		`    ${cyan("browser-use cookies export <path>")}               ${dim("# save auth state to a file")}`,
-		`    ${cyan("browser-use cookies import <path>")}               ${dim("# load auth state from a file")}`,
+		dim("  Structured extraction (consistent JSON output via JSON Schema):"),
+		`    ${cyan("# add data_extraction_schema to the POST body. Example below:")}`,
+		`    ${cyan("-d '{")}`,
+		`    ${cyan("  \"prompt\": \"Get the top post on hacker news\",")}`,
+		`    ${cyan("  \"url\": \"https://news.ycombinator.com\",")}`,
+		`    ${cyan("  \"data_extraction_schema\": {")}`,
+		`    ${cyan("    \"type\": \"object\",")}`,
+		`    ${cyan("    \"properties\": {")}`,
+		`    ${cyan("      \"title\":  {\"type\":\"string\"},")}`,
+		`    ${cyan("      \"url\":    {\"type\":\"string\"},")}`,
+		`    ${cyan("      \"points\": {\"type\":\"integer\"}")}`,
+		`    ${cyan("    }")}`,
+		`    ${cyan("  }")}`,
+		`    ${cyan("}'")}`,
 		"",
-		dim("  Showing the principal something visual: save with screenshot /tmp/<name>.png,"),
-		dim("  then surface the path in your reply (or xdg-open the file on a desktop)."),
+		dim("  Use the principal's REAL Chrome (skips login walls):"),
+		dim("  1) Enable Chrome remote debugging once (chrome://inspect/#remote-debugging),"),
+		dim("     or run: skyvern init browser"),
+		dim("  2) In ~/.skyvern/.env set:"),
+		`       ${cyan("BROWSER_TYPE=cdp-connect")}`,
+		`       ${cyan("BROWSER_REMOTE_DEBUGGING_URL=http://127.0.0.1:9222")}`,
+		dim("  3) Restart: skyvern stop all && skyvern run server &"),
+		dim("  Subsequent runs reuse the live Chrome session, with all existing logins."),
 		"",
-		dim("  Full reference: browser-use --help, browser-use <cmd> --help"),
-		dim("  Project: https://github.com/browser-use/browser-use"),
+		dim("  Engines (set engine= in the task body):"),
+		dim("    skyvern-2.0   — default; planner+actor+validator swarm; best on multi-step"),
+		dim("    skyvern-1.0   — leaner; good for single-page form fills"),
+		dim("    openai-cua    — OpenAI Computer Use (requires OpenAI key)"),
+		dim("    anthropic-cua — Claude Sonnet computer-use tool (requires Anthropic key)"),
+		"",
+		dim("  Other useful endpoints:"),
+		`    ${cyan("GET  /v1/runs/{run_id}")}             ${dim("# state, status, extracted_information")}`,
+		`    ${cyan("POST /v1/runs/{run_id}/cancel")}      ${dim("# stop a stuck task")}`,
+		`    ${cyan("GET  /v1/runs?limit=10")}             ${dim("# recent runs")}`,
+		"",
+		dim("  Full reference:  https://www.skyvern.com/docs/api-reference"),
+		dim("  Project:         https://github.com/Skyvern-AI/skyvern"),
 	].join("\n"));
 };
 

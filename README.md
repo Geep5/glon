@@ -39,7 +39,7 @@ The kernel knows nothing about LLMs. The fact that `/agent` exists at the progra
 **Prerequisites**
 - Node 20+ (the dev server uses the built-in `node:sqlite`).
 - For LLM agents: either an Anthropic API key (`ANTHROPIC_API_KEY`) or a Claude Pro/Max plan (set up via `/auth login anthropic`). Discord bot token if you want the bridge.
-- For agents that browse the web: [`browser-use`](https://github.com/browser-use/browser-use) on `$PATH`. The default Holdfast system prompt teaches `browser-use --profile` as the canonical browser path; without it installed, any browser task an agent attempts will fail. Install once on the host machine:
+- For agents that browse the web: [Skyvern](https://github.com/Skyvern-AI/skyvern) running locally as a long-lived service on `127.0.0.1:8000`. Skyvern is a Python service (planner + actor + validator agents on top of Playwright + a vision LLM); the default Holdfast system prompt teaches agents to drive it via REST, and without it running any browser task will fail. Install once on the host:
 
 **Install**
 ```bash
@@ -47,10 +47,14 @@ git clone https://github.com/Geep5/glon.git
 cd glon && npm install
 cp .env.example .env        # fill in secrets (see sections below)
 
-# If any agent on this harness will browse the web, also install browser-use:
-pipx install browser-use    # or: pip install --user browser-use
-browser-use install         # downloads Chromium + system deps
-browser-use doctor          # verifies the install
+# If any agent on this harness will browse the web, also install Skyvern:
+pip install skyvern         # or: pipx install skyvern
+skyvern quickstart          # one-time setup: ~/.skyvern (DB, .env with API key)
+skyvern run server &        # long-running service on 127.0.0.1:8000
+# Configure an LLM key in ~/.skyvern/.env (LLM_KEY=ANTHROPIC + ANTHROPIC_API_KEY=...,
+# or LLM_KEY=OPENAI_GPT4O + OPENAI_API_KEY=...). For sites with active Chrome
+# logins, also enable Chrome remote debugging and set BROWSER_TYPE=cdp-connect
+# in ~/.skyvern/.env.
 ```
 
 **Run**
@@ -89,7 +93,7 @@ Every script auto-loads `.env` from the project root, so `ANTHROPIC_API_KEY` and
 | `/discord` | I/O bridge: Gateway WebSocket for online presence + 3s REST poll for DMs, routes to `/holdfast.ingest`, posts replies back |
 | `/holdfast` | Generic agent harness: wraps an `/agent` with identity-aware ingest, memory, scheduled reminders, shell access, and subagent spawning. Configure once with `/holdfast setup --name <NAME>` |
 | `/web` | Shell cheatsheet for HTTP from the REPL — `curl` + `jq` + `pandoc` recipes when an agent (or human) needs raw bytes / JSON / typed APIs. For loading a real web page (login walls, JS, interaction), see `/browser` |
-| `/browser` | Shell cheatsheet for the `browser-use` CLI — the canonical browser path for agents. Recipes for `--profile` (use the principal's real Chrome with all existing logins), `state`/`click`/`screenshot`, multi-step flows. No actor; the agent shells out directly |
+| `/browser` | Shell cheatsheet for [Skyvern](https://github.com/Skyvern-AI/skyvern), the canonical browser path for agents. Skyvern runs as a local service on :8000; agents POST tasks via REST and poll for results. Recipes cover one-shot tasks, structured-output extraction via JSON Schema, and connecting to the principal's real Chrome via `BROWSER_TYPE=cdp-connect` |
 | `/shell` | Persistent bash sessions an agent can drive |
 | `/google` | Shell cheatsheet for the `gws` CLI (calendar / gmail / drive / sheets / docs). Auth lives in gws's keyring; the agent invokes it via `shell_exec gws +<verb>` |
 | `/anytype` | Shell cheatsheet for the local Anytype REST API on `127.0.0.1:31009`. Optional — only useful if Anytype Desktop is running |
