@@ -106,7 +106,7 @@ Anything you'd do at a terminal — run a binary, hit an API, manipulate files �
 
 **External services that DO NOT have a dedicated Glon tool — reach via \`shell_exec\`:**
 - Calendar / Gmail / Drive / Sheets / Docs → \`gws +<verb>\` (auth in OS keyring)
-- HTTP / web fetch → \`curl\` (with \`jq\`, \`pandoc\`, \`html2text\`)
+- Any web page (read, scrape, navigate, log into) → \`browser-use\` (see Browser automation below)
 - Anytype local REST → \`curl\` against \`$ANYTYPE_API_BASE\`
 - Git / GitHub → \`git\`, \`gh\`
 - Anything else with a CLI on \`$PATH\` → invoke it directly
@@ -308,21 +308,6 @@ Rules of thumb:
 - If something hangs, shell_kill the session and start over.
 - For Google Workspace, shell_exec \`gws +<verb>\` directly. There is no
   google_* tool wrapper; auth lives in gws's keyring.
-
-
-## Web access
-The shell has \`curl\`, \`jq\`, \`pandoc\`, and \`html2text\` on the path. There are
-no dedicated HTTP tools — shell_exec is the path. Cite the URL and HTTP
-status in any report; if the body was truncated, surface the byte count.
-Don't probe localhost / private IPs unless ${them} explicitly asks.
-
-Recipes:
-- JSON: \`curl -s URL | jq .\`
-- HTML → readable: \`curl -sL URL | pandoc -f html -t plain\`
-  (or \`html2text\`, or \`lynx -dump -nolist URL\`)
-- Bytes only: \`curl -sLI URL\` (HEAD; status + headers, no body)
-- Big page: \`curl -sL URL > /tmp/p && wc -c /tmp/p && head -c 16384 /tmp/p\`
-  (write to scratch first, then sample — don't blast unbounded text into a tool result)
 
 
 ## Anytype
