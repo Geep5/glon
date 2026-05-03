@@ -64,7 +64,7 @@ export interface ProgramContext {
 	programId: string;
 
 	/** Get an object actor handle by ID. */
-	objectActor: (id: string) => unknown;
+	objectActor: (id: string, opts?: { createWithInput?: unknown }) => unknown;
 
 	/**
 	 * Dispatch an action on another program's actor by prefix.

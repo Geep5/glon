@@ -74,7 +74,7 @@ function buildContext(overrides?: Partial<ProgramContext>): ProgramContext {
 		state: {},
 		emit: () => {},
 		programId: "",
-		objectActor: (id: string) => client.objectActor.getOrCreate([id]),
+		objectActor: (id: string, opts?: { createWithInput?: unknown }) => client.objectActor.getOrCreate([id], opts),
 		dispatchProgram: async (prefix: string, action: string, args: unknown[]) => {
 			const inst = getProgramActorByPrefix(prefix);
 			if (!inst) throw new Error(`Program not running: ${prefix}`);

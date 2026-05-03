@@ -596,7 +596,7 @@ async function loadTokenState(
 // ── Handler (CLI) ────────────────────────────────────────────────
 
 const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
-	const { print, resolveId } = ctx;
+	const { print, resolveId, randomUUID, dispatchProgram } = ctx;
 
 	switch (cmd) {
 		case "balance": {
@@ -657,9 +657,73 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			break;
 		}
 
+		case "deploy": {
+			const name = args[0];
+			const symbol = args[1];
+			const supplyStr = args[2];
+			const decimalsArg = args.find((a) => a.startsWith("--decimals="));
+			const decimals = decimalsArg ? Number(decimalsArg.split("=")[1]) : 0;
+			const keyArg = args.find((a) => a.startsWith("--key="));
+			const keyName = keyArg ? keyArg.split("=")[1] : "default";
+
+			if (!name || !symbol || !supplyStr) {
+				print(red("Usage: token deploy <name> <symbol> <supply> [--decimals=N] [--key=name]"));
+				break;
+			}
+			if (Number.isNaN(decimals) || decimals < 0 || decimals > MAX_DECIMALS) {
+				print(red(`decimals must be in [0, ${MAX_DECIMALS}]`));
+				break;
+			}
+			try {
+				// Ensure wallet key exists
+				let keyInfo: any = await dispatchProgram("/wallet", "show", [keyName]);
+				if (!keyInfo) {
+					print(dim(`Creating wallet key "${keyName}"...`));
+					keyInfo = await dispatchProgram("/wallet", "new", [keyName]);
+				}
+				const pubkey = keyInfo.pubkey as string;
+
+				// Build unsigned deploy change
+				const tokenId = randomUUID().replace(/-/g, "").slice(0, 24);
+				const { changeB64 } = await dispatchProgram("/token", "buildDeploy", [{
+					tokenId,
+					timestamp: Date.now(),
+					author: "token-deploy",
+					name,
+					symbol,
+					decimals,
+					ownerPubkeyHex: pubkey,
+					initialSupply: supplyStr,
+				}]) as { changeB64: string };
+
+				// Sign
+				const { changeB64: signedB64 } = await dispatchProgram("/wallet", "signChange", [{
+					name: keyName,
+					changeB64,
+					nonce: 1,
+					fee: 100, // Deploy = 100x base fee
+				}]) as { changeB64: string };
+
+				// Push via object actor with createWithInput so the actor initializes with the correct id
+				const objActor = ctx.objectActor(tokenId, { createWithInput: { id: tokenId } });
+				await objActor.pushChanges(signedB64);
+
+				print(green("Token deployed!"));
+				print(dim("  id:     ") + tokenId);
+				print(dim("  name:   ") + name);
+				print(dim("  symbol: ") + symbol);
+				print(dim("  supply: ") + supplyStr);
+				print(dim("  owner:  ") + pubkey);
+			} catch (err: any) {
+				print(red("Error: ") + (err?.message ?? String(err)));
+			}
+			break;
+		}
+
 		default: {
 			print([
 				bold("  Token") + dim(" — chain-mode fungible token (chain.token)"),
+				`    ${cyan("token deploy")} ${dim("<name> <symbol> <supply> [--decimals=N] [--key=name]")}  deploy a new token`,
 				`    ${cyan("token info")} ${dim("<token_id>")}            metadata + supply + owner`,
 				`    ${cyan("token balance")} ${dim("<token_id> <pubkey>")} balance for one holder`,
 				`    ${cyan("token holders")} ${dim("<token_id>")}          all balances, descending`,
