@@ -417,6 +417,249 @@ own store is a regular `object_list type_key=pinned_fact/milestone` query; no
 special read path.
 
 
+## Chain layer
+
+A signed-token chain on the same per-actor DAG primitives. Three programs
+(`/wallet`, `/token`, `/consensus`) plus a `chainMode` flag on `ProgramDef`
+plus a kernel-level signature gate. Tokens, balances, and allowances are
+regular Glon objects whose state is computed by replaying the DAG.
+
+### Trust model
+
+Two assumptions, separately costed:
+
+1. **Signature integrity** — the safety assumption. Ed25519 over canonical-
+   encoded bytes; if the math is sound, no other party can forge a user's
+   transaction.
+2. **Honest majority of plotted disk space** — the liveness/finality
+   assumption, applicable when proof-of-space-and-time anchors land in a
+   later phase.
+
+v1 has assumption (1) live and assumption (2) deferred. Signed Changes
+propagate via existing per-actor sync; there is no global ordering yet.
+
+### Chain-mode flag
+
+A program declares its types as chain-mode by setting `chainMode: true` on
+`ProgramDef` alongside `validatedTypes`:
+
+```typescript
+export default {
+  validatedTypes: ["chain.token"],
+  chainMode: true,
+  // ...
+};
+```
+
+`runtime.ts` builds a `Set<typeKey>` of chain-mode types from every program
+with `chainMode: true && validatedTypes`. The kernel queries it via
+`isChainModeType(typeKey)` at two chokepoints:
+
+- `pushChanges` — the peer-sync write path. Verifies the signature on every
+  Change before any program validator runs.
+- `commitChange` — the local-mutator write path used by `setField`,
+  `addBlock`, etc. Rejects all writes to chain-mode objects; callers must
+  construct a signed Change and submit via `pushChanges`.
+
+Non-chain objects continue to use the existing protobufjs encoding and the
+legacy mutator actions. Nothing changes for `/agent`, `/chat`, `/ttt`, etc.
+
+### Canonical encoding (src/det/canonical.ts)
+
+Protobuf3 wire format is byte-stable EXCEPT for `map<>` field encoding
+order, which is implementation-defined. Two protobufjs versions, or
+protobufjs vs protobuf-go vs protobuf-c++, can produce byte-different
+output for the same logical message. This breaks consensus the moment any
+node disagrees on a Change's hash.
+
+`canonicalEncodeChange` recursively walks the message and sorts every
+`map<>` entry set by UTF-8 byte order before handing to the standard
+protobufjs encoder. Maps appear at three nesting points:
+
+- `ValueMap.entries` (recursive — contained Values can themselves contain ValueMap)
+- `ObjectSnapshot.fields` (only relevant when a snapshot is embedded)
+- `CustomContent.meta`
+
+Two encoders ship:
+
+- **`canonicalEncodeChange(c)`** — bytes used to compute `change.id`. The
+  `id` field is zeroed; `authorSig` (if present) is included. Different
+  signatures therefore produce different ids — a witness can't substitute
+  another signer's authorization at the same id.
+- **`canonicalEncodeChangeForSigning(c)`** — bytes the author signs.
+  Both `id` AND `authorSig.signature` are zeroed; `authorSig.pubkey`,
+  `nonce`, `fee` are present. The signer commits to all four metadata
+  fields, so changing fee or nonce after signing invalidates the signature.
+
+Scope: only chain-mode objects use canonical encoding in v1. Non-chain
+objects keep the existing `encodeChangeForHashing`. Going global-canonical
+would change every existing object's id (one-time migration), deferred.
+
+### Signature gate (src/index.ts)
+
+For every chain-mode Change in a `pushChanges` batch, the kernel verifies:
+
+1. `authorSig` is present.
+2. `pubkey.length === 32`.
+3. `signature.length === 64`.
+4. Ed25519 signature verifies against `canonicalEncodeChangeForSigning(change)`.
+5. `change.id === sha256(canonicalEncodeChange(change))`.
+
+Any failure throws and rejects the entire batch — peers can't slip an
+invalid Change in alongside valid ones. The Ed25519 implementation lives
+in `src/det/ed25519.ts`: raw 32-byte keys, wrapped in SPKI/PKCS8 DER for
+Node's built-in `node:crypto.{sign, verify}`. No new package dependency.
+
+### Determinism substrate (src/det/)
+
+Three modules, all importable by chain-mode programs as kernel externals
+(via the same mechanism that exposes `proto.js` and `crypto.js`):
+
+- **`canonical.ts`** — the two encoders above.
+- **`math.ts`** — `BigInt`-only helpers: `parseUint(s, max)`, `toBigInt(v)`,
+  `addBounded(a, b, max)`, `subChecked(a, b)`, `bigToString(n)`,
+  `bigCompare(a, b)`, plus `U128_MAX`, `U64_MAX`, `BIG_ZERO` constants.
+  Strict input rejection — no hex prefixes, no negatives, no scientific
+  notation. `Number` values above `Number.MAX_SAFE_INTEGER` are rejected.
+- **`ed25519.ts`** — `generateKeyPair()`, `sign(privateKey, message)`,
+  `verify(publicKey, message, signature)`. All three take/return raw byte
+  arrays; the SPKI/PKCS8 wrapping is internal.
+
+`test/chain/det-lint.test.ts` scans the consensus paths for banned APIs
+(`Date.now`, `Math.random`, `Math.floor`/`ceil`/`round`/`max`/`min`,
+`parseInt`, `parseFloat`, `Number(`, `JSON.stringify`). Inline suppressions
+via `// det-lint-ignore: <reason>` are allowed for cases like error-message
+formatting where the output is never hashed. The scanner self-tests on a
+synthetic input and fails the suite if any banned use slips into a
+registered consensus file.
+
+`test/chain/determinism.test.ts` runs the same Change through
+`canonicalEncodeChange` in the test process AND in a fresh subprocess
+spawned via `npx tsx -e <script>`, then asserts byte-identical output.
+This is the only test that catches divergence between independent Node
+processes — the closest analog the harness has to "two nodes on the
+network agreeing on a hash."
+
+### `/wallet` — two-tier storage
+
+`/wallet` is local-only; **not** chain-mode. Its private material would
+be a disaster to put in the DAG (every peer would have your keys). Same
+pattern `/auth` uses for Anthropic credentials:
+
+```
+${GLON_DATA}/wallet.json    mode 0600, atomic write via .tmp + rename
+  {
+    version: 1,
+    keys: {
+      "alice": {
+        pubkey: "...",     // 32-byte hex
+        privateKey: "...", // 32-byte hex (Ed25519 seed)
+        createdAt: 1234,
+      }
+    }
+  }
+```
+
+The wallet exposes `signChange({name, changeB64, nonce, fee})` as an actor
+action. It decodes the unsigned Change, fills in `authorSig` (pubkey +
+empty signature placeholder + nonce + fee), computes the canonical signing
+payload, signs, fills in the signature bytes, computes the canonical id,
+and returns the fully-formed signed Change as base64. Private material is
+exposed by NO action — `list`, `show`, `keyForPubkey` all return metadata
+only.
+
+### `/token` — state via DAG replay
+
+Each token is one Glon object with `typeKey: "chain.token"`. Two storage
+conventions, neither novel for Glon:
+
+- **Static metadata in fields**: `name`, `symbol`, `decimals`,
+  `owner_pubkey`, `initial_supply`, `storage_credit` (reserved for v2 rent;
+  always `"0"` in v1). Set once at deploy time via `FieldSet` ops in the
+  genesis Change.
+- **Operations as `CustomContent` blocks**: each op is one `BlockAdd`
+  with `contentType: "chain.token.op"`. `meta` carries the op kind plus
+  parameters plus the signer's pubkey hex. Block ids and DAG order are
+  the canonical sequence.
+
+State (balances, total_supply, allowances) is **derived** from `fields +
+blocks` via `replayState`. Initial supply is credited to `owner_pubkey`
+implicitly during replay. State is never stored — same model `/agent` uses
+for conversation views and `/comment` uses for thread structure.
+
+Six op kinds: `Mint`, `Transfer`, `Approve`, `TransferFrom`, `Burn`,
+`RenounceMint`. All semantic invariants (only-owner mints, allowance
+underflow, U128_MAX overflow, mint-after-renounce rejection) live in
+`applyOpToState`, which throws on any violation. The validator runs it
+against a clone of current state in try/catch; thrown errors become
+`{valid: false, error}` returns.
+
+`/token` exposes its rules via the `validate_op` actor action rather than
+registering a top-level validator. `/consensus` is the sole registered
+validator for `chain.token`, dispatching to `validate_op` after its own
+checks pass.
+
+### `/consensus` — validator pipeline
+
+The kernel calls `/consensus`'s validator before disk-write. Pipeline per
+chain-mode Change (after the kernel signature gate has fired):
+
+```
+kernel pushChanges
+  ├─ Ed25519 sig verified, change.id matches canonical hash
+  └─ getValidator("chain.token") → /consensus's validator
+       ├─ consensusGate(change, state)
+       │    ├─ nonce > last seen for pubkey? (replay protection)
+       │    └─ fee >= minimumFee(kind, policy)?
+       │         Deploy: base × 100
+       │         Mint:   base × 10
+       │         Other:  base × 1   (Transfer / Burn / Approve / etc.)
+       └─ on accept: state advances (per-pubkey nonce updated)
+
+asynchronous follow-up (via /consensus.check or future anchor pipeline):
+  └─ dispatchProgram("/token", "validate_op", {tokenId, changeB64})
+       └─ /token replays prior state, applies op to a clone, checks invariants
+```
+
+The split is necessary because Glon's registered-validator API is
+synchronous and can't `await dispatchProgram`. The synchronous validator
+catches all signature/nonce/fee violations in the kernel pipeline; semantic
+violations (a Transfer with no balance, a Mint by a non-owner) are caught
+by `/token.validate_op` either via explicit pre-flight (`/consensus.check`)
+or by replay invariants that surface on read. v2 will fold the dispatch
+into the validator API and remove the asynchrony gap.
+
+Per-pubkey nonce store lives in `/consensus`'s actor state as
+`nonces: Record<pubkey_hex, number>`. The synchronous validator reads from
+a module-local mirror that the actor's `recordAccepted` action keeps in
+sync; the mirror exists only because the synchronous validator can't take
+a context. Tests reset the mirror via `__test.resetMirror()` between cases.
+
+### What's deferred
+
+- **`/anchor` program**: anchor blocks committing to a Merkle root over
+  every chain-mode object's head. Once anchors land, finalized Changes
+  carry global ordering and can survive reorgs. Anchor block format
+  already includes `state_root` and `vdf_iterations_target` fields in the
+  cleanroom spec; the placeholder implementation can sign anchors with a
+  bootstrap key while PoST integration follows.
+- **PoST cryptography**: [`chiapos`](https://github.com/Chia-Network/chiapos)
+  for proof-of-space, [`chiavdf`](https://github.com/Chia-Network/chiavdf)
+  for verifiable delay functions. Both libraries are C++ with Apache 2.0
+  licenses; the integration plan is subprocess-only via the bundled CLI
+  binaries (`ProofOfSpace`, `vdf_client`) — Node bindings would be a
+  multi-week side quest the v1 spec deliberately avoids.
+- **Reorg / fork choice**: requires anchor chain + cumulative-VDF-iterations
+  comparison. Without anchors there's nothing to fork.
+- **Adversarial sync hardening**: the existing pushChanges path is the
+  signature gate's enforcement point, but real P2P sync (peer scoring,
+  ban list, bounded buffer, eclipse defense) remains TBD; `src/programs/handlers/sync.ts`
+  is currently a stub.
+- **State rent / storage_credit accounting**: every full node stores all
+  chain state forever in v1. The `storage_credit` field is reserved on
+  every `chain.token` object (always `"0"` today) so the rent migration
+  doesn't require a per-object schema change.
+
 ## Security Model
 
 ### Accounts & Authentication

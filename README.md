@@ -9,15 +9,17 @@ glon is inspired by [Anytype](https://anytype.io)'s philosophy — no hierarchy,
 ## Layered architecture
 
 ```
-                ┌───────────────────────────────────────────────────┐
-   apps         │  Holdfast · custom assistants · automations · …   │   ← configurations of programs
-                ├───────────────────────────────────────────────────┤
-   programs     │  /agent /task /memory /chat /crud /graph /peer …  │   ← user-space, all hot-loadable
-                ├───────────────────────────────────────────────────┤
-   kernel       │  objects · actors · DAG · sync · programs runtime │   ← every primitive is content-addressed
-                ├───────────────────────────────────────────────────┤
-   transport    │  protobuf wire format · HTTP · mDNS · sqlite cache│
-                └───────────────────────────────────────────────────┘
+                ┌──────────────────────────────────────────────────────┐
+   apps         │  Holdfast · Tally (chain-aware) · automations · …    │   ← configurations of programs
+                ├──────────────────────────────────────────────────────┤
+   programs     │  /agent /memory /chat /peer /wallet /token …         │   ← user-space, all hot-loadable
+                ├──────────────────────────────────────────────────────┤
+   chain layer  │  /consensus signature gate · canonical encode · det/ │   ← only fires for chain-mode types
+                ├──────────────────────────────────────────────────────┤
+   kernel       │  objects · actors · DAG · sync · programs runtime    │   ← every primitive is content-addressed
+                ├──────────────────────────────────────────────────────┤
+   transport    │  protobuf wire format · HTTP · mDNS · sqlite cache   │
+                └──────────────────────────────────────────────────────┘
 ```
 
 The kernel knows nothing about LLMs. The fact that `/agent` exists at the program layer is convention; remove it and glon is still a working distributed object store with `/chat`, `/ttt`, and any other program you write.
@@ -97,6 +99,9 @@ Every script auto-loads `.env` from the project root, so `ANTHROPIC_API_KEY` and
 | `/accounts` | Multi-user auth and per-object permissions |
 | `/auth` | Anthropic credential management: OAuth login for Claude Pro/Max, or fall back to API key |
 | `/sync` | P2P sync via mDNS discovery and HTTP |
+| `/wallet` | Local-only Ed25519 keychain. Stored at `${GLON_DATA}/wallet.json` mode 0600, never synced. Generates keys, signs Changes for chain-mode objects |
+| `/token` | Fungible-token program. Each token is a `chain.token` object: static metadata in fields, ops (Mint/Transfer/Approve/TransferFrom/Burn/RenounceMint) as `CustomContent` blocks, balances + total supply derived by DAG replay |
+| `/consensus` | Validator gate for every chain-mode type. Per-pubkey nonce monotonicity, asymmetric fee policy (Deploy 100×, Mint 10×, Other 1×), dispatch to per-type semantic validators. Lives at the same layer as `/token`, runs first in the kernel pipeline |
 
 Every program `export default`s a `ProgramDef`:
 
@@ -106,6 +111,7 @@ export default {
   actor: { ... },                                // persistent state + RPC (optional)
   validator: (changes) => { ... },               // DAG gating (optional)
   validatedTypes: ["character", "item"],         // types to validate (optional)
+  chainMode: true,                               // require signed Changes for those types (optional)
 };
 ```
 
@@ -274,6 +280,71 @@ glon> /ttt history a3f8
   d71da0218bb3  06:27:49  X wins
 ```
 
+## Chain on glon
+
+A signed-token chain layered on the same per-actor DAG primitives. Three programs (`/wallet`, `/token`, `/consensus`) plus a `chainMode` flag on `ProgramDef`, plus a small kernel hook that verifies an Ed25519 signature on every chain-mode `Change` before any program validator sees it. Tokens, balances, and allowances are regular Glon objects whose state is computed by replaying the DAG — same model `/chat`, `/agent`, and every other program use.
+
+Two trust assumptions:
+
+1. **Signature integrity** — for safety. Ed25519 over canonical-encoded bytes; if the signature math is sound, an attacker cannot forge another user's transaction. This is the assumption v1 leans on.
+2. **Honest majority of plotted disk space** — for liveness and finality, when proof-of-space-and-time anchors land in a later phase. v1 has signed Changes that propagate via existing sync, but no global ordering yet.
+
+| Chain feature | Built on which kernel primitive |
+---|---|
+| Signed transactions | `Change.author_sig` (Ed25519 + nonce + fee). The kernel verifies sig + canonical hash before validator dispatch |
+| Replay protection | Per-pubkey monotonic nonce in `/consensus`'s actor state |
+| Asymmetric fees | `/consensus` enforces base × {100, 10, 1} for {Deploy, Mint, Other} on every chain-mode Change |
+| Token state | `chain.token` object — fields hold static metadata (`name`, `symbol`, `decimals`, `owner_pubkey`, `initial_supply`); ops are `CustomContent` blocks (`chain.token.op`); balances/total_supply derived by DAG replay |
+| Wallet | Local-only `${GLON_DATA}/wallet.json` (mode 0600). Same pattern as `/auth`. Private keys never touch the DAG |
+| Determinism | `src/det/` — canonical proto encoder (sorts every `map<>` by UTF-8 byte order before encoding), BigInt-only math helpers, raw-Ed25519 wrappers around Node's `node:crypto`. `det-lint` test scans consensus paths for banned APIs (`Date.now`, `Math.random`, `Number(`, etc.) |
+
+### Example: deploy and transfer
+
+```
+glon> /wallet new alice
+  Wallet key created
+    name:   alice
+    pubkey: a1b2c3d4...
+    Stored in /Users/grant/.glon/wallet.json (mode 0600)
+
+glon> /consensus status
+  Consensus — chain-mode validator gate
+    base fee:   1
+    min Deploy: 100
+    min Mint:   10
+    min Other:  1
+    nonces:     0 pubkey(s) tracked
+```
+
+Construct + sign + submit a token deploy through the actor APIs:
+
+```typescript
+// /token.buildDeploy → unsigned Change
+// /wallet.signChange → signed Change
+// objectActor(tokenId).pushChanges → kernel verifies sig, /consensus checks
+//   nonce + fee, /token.validate_op verifies semantics, persisted to disk
+```
+
+The full `/wallet send` and `/token deploy` CLIs (which wrap that flow) are in
+the next session's scope. Today the chain is testable end-to-end via the
+actor-API helpers and `objectActor.pushChanges`.
+
+### What runs today
+
+- Signed `Change` propagation across instances via existing per-actor sync. A signed transfer made on instance A becomes visible on instance B after sync, both nodes converging on the same balances by replaying the same blocks.
+- Validator pipeline: signature gate (kernel) → nonce monotonicity (`/consensus`) → asymmetric fee (`/consensus`) → semantic check (`/token.validate_op`).
+- Per-pubkey nonces, replay rejection, U128 overflow protection on every balance/supply update.
+- 123 chain-layer tests including a subprocess-isolation determinism check that hashes the same Change in a fresh Node process and asserts byte-identical output.
+
+### What's deferred
+
+- **`/anchor`**: global ordering and finality via PoST anchor blocks. Without it, signed Changes propagate but have no canonical ordering — fine for the substrate, not yet a "real chain."
+- **PoST cryptography** (proof of space and time, via [chiapos](https://github.com/Chia-Network/chiapos) and [chiavdf](https://github.com/Chia-Network/chiavdf)): out-of-process integration via the bundled CLI binaries; not Node bindings.
+- **Reorg / fork choice**: requires the anchor chain.
+- **Adversarial sync hardening** (peer scoring, ban list, bounded buffer): the existing `pushChanges` path enforces the signature gate, but real P2P sync hardening is its own piece of work.
+
+See [ARCHITECTURE.md § Chain layer](ARCHITECTURE.md#chain-layer) for canonical encoding, the signature gate flow, and the `/consensus` validator pipeline.
+
 ## Anthropic plan setup (Claude Pro/Max)
 
 `/agent` and `/holdfast` work with two kinds of Anthropic credentials:
@@ -441,8 +512,13 @@ src/
   bootstrap.ts                seed source files + programs as objects
   client.ts                   CLI shell (pure program loader)
   programs/
-    runtime.ts                module bundler, actor lifecycle, validators
-    handlers/                 one file per program (24 today)
+    runtime.ts                module bundler, actor lifecycle, validators, chain-mode registry
+    handlers/                 one file per program (27 today)
+  det/                        chain-mode determinism substrate
+    canonical.ts              proto encoder with sorted map<> entries (consensus-grade)
+    math.ts                   BigInt helpers; banned-API alternatives
+    ed25519.ts                raw 32-byte Ed25519 sign/verify via node:crypto
+    index.ts                  re-exports
 scripts/
   daemon.ts                   headless host: load programs, run actors, HTTP dispatch
   dispatch.ts                 thin HTTP client for the daemon
@@ -476,6 +552,13 @@ test/
   comment.test.ts             /comment post / reply / react / unreact / list / thread
   chat.test.ts                /chat alias to /comment dispatch + legacy block render
   introspection.test.ts       agent reads its own source via /crud
+  chain/
+    determinism.test.ts       canonical encoder; subprocess-isolation hash check
+    det-lint.test.ts          banned-API scanner over consensus paths
+    signature-gate.test.ts    Ed25519 verify, tamper detection, id↔canonical hash
+    wallet.test.ts            local keychain, mode-0600 storage, signing round-trip
+    token.test.ts             chain.token classification, replay, all op kinds, U128 boundary
+    consensus.test.ts         nonce monotonicity, asymmetric fees, validator dispatch
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for internals: DAG replay, actor state model, sync handshake, program context, and the security model.
