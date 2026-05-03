@@ -44,6 +44,22 @@ message Change {
   // Snapshots are never source of truth — they are a replay optimization.
   // The DAG of ops remains canonical; snapshots just let us skip prefix replay.
   ObjectSnapshot snapshot = 7;  // optional state checkpoint (speeds up replay)
+
+  // Author signature, present iff the object is chain-mode. The kernel
+  // verifies it before any program validator sees the change.
+  // Field 20 (not 8) leaves room for future kernel-level fields.
+  Signature author_sig = 20;
+}
+
+// Ed25519 signature plus per-pubkey replay-protection nonce and per-change
+// fee. Signature bytes are over the canonical-encoded Change with `id` and
+// `author_sig.signature` cleared (pubkey/nonce/fee ARE included; the
+// signer commits to them).
+message Signature {
+  bytes  pubkey    = 1;    // 32-byte Ed25519 public key
+  bytes  signature = 2;    // 64-byte Ed25519 signature
+  uint64 nonce     = 3;    // per-pubkey monotonic; replay protection
+  uint64 fee       = 4;    // micro-units paid to anchor farmer; 0 = no fee
 }
 
 // Atomic mutation within a Change. Applied in order during replay.

@@ -30,7 +30,9 @@ import {
 } from "./dag/change.js";
 import { computeState, findHeads, toSnapshot, type ObjectState, type BlockProvenance } from "./dag/dag.js";
 import { initDisk, writeChange, readChangeByHex, listChangeFilesForObject, deleteChangesForObject, diskStats } from "./disk.js";
-import { getValidator } from "./programs/runtime.js";
+import { getValidator, isChainModeType } from "./programs/runtime.js";
+import { canonicalEncodeChange, canonicalEncodeChangeForSigning } from "./det/canonical.js";
+import { verify as ed25519Verify } from "./det/ed25519.js";
 import {
 	assertPortAvailable,
 	clearEndpointLockfile,
@@ -124,6 +126,15 @@ function headBytes(c: { vars: ObjectVars }): Uint8Array[] {
 
 /** Write a change to disk, recompute vars from DAG, broadcast. */
 function commitChange(c: any, change: Change): void {
+	// Local mutators (setField, addBlock, etc.) cannot produce signed
+	// Changes — chain-mode objects MUST go through pushChanges with a
+	// pre-built signed Change so the kernel can verify the signature.
+	if (c.vars.typeKey && isChainModeType(c.vars.typeKey)) {
+		throw new Error(
+			`commitChange: object ${c.state.id} has chain-mode type ${c.vars.typeKey}; ` +
+			`use pushChanges with a signed Change instead of direct mutators`,
+		);
+	}
 	writeChange(change);
 	const result = loadFromDisk(c.state.id);
 	if (result) {
@@ -319,6 +330,46 @@ const objectActor = actor({
 					}
 				}
 			}
+
+			// ── Chain-mode signature gate ──────────────────────────────
+			// Verify Ed25519 sig before any program validator sees the change.
+			// Chain-mode objects without a valid signature are rejected here
+			// regardless of validator behaviour.
+			if (effectiveTypeKey && isChainModeType(effectiveTypeKey)) {
+				for (const change of decoded) {
+					const sig = change.authorSig;
+					if (!sig || !sig.pubkey || sig.pubkey.length === 0) {
+						throw new Error(
+							`signature gate: chain-mode change for object ${change.objectId} is missing author_sig`,
+						);
+					}
+					if (sig.pubkey.length !== 32) {
+						throw new Error(
+							`signature gate: pubkey must be 32 bytes (got ${sig.pubkey.length})`,
+						);
+					}
+					if (!sig.signature || sig.signature.length !== 64) {
+						throw new Error(
+							`signature gate: signature must be 64 bytes (got ${sig.signature?.length ?? 0})`,
+						);
+					}
+					const signingBytes = canonicalEncodeChangeForSigning(change);
+					const ok = ed25519Verify(sig.pubkey, signingBytes, sig.signature);
+					if (!ok) {
+						throw new Error(
+							`signature gate: invalid signature for change in ${change.objectId}`,
+						);
+					}
+					// Also verify the content-address: id MUST equal sha256(canonical(change with id zeroed)).
+					const expectedId = sha256(canonicalEncodeChange(change));
+					if (hexEncode(expectedId) !== hexEncode(change.id)) {
+						throw new Error(
+							`signature gate: change id does not match canonical hash`,
+						);
+					}
+				}
+			}
+
 			const validator = getValidator(effectiveTypeKey);
 			if (validator) {
 				const result = validator(decoded);

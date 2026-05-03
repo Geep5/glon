@@ -16,6 +16,10 @@
 import type { Value, Change, ObjectRef } from "../proto.js";
 import * as proto from "../proto.js";
 import * as cryptoMod from "../crypto.js";
+import * as detCanonical from "../det/canonical.js";
+import * as detMath from "../det/math.js";
+import * as detEd25519 from "../det/ed25519.js";
+import * as det from "../det/index.js";
 import * as esbuild from "esbuild";
 
 // ── Types ───────────────────────────────────────────────────────
@@ -94,6 +98,14 @@ export interface ProgramDef {
 	actor?: ProgramActorDef;
 	validator?: ValidatorFn;
 	validatedTypes?: string[];
+	/**
+	 * If `true`, every type in `validatedTypes` is a chain-mode type:
+	 * the kernel requires `author_sig` on every Change and verifies the
+	 * signature before the program's validator runs. Direct mutations
+	 * (setField, addBlock, etc.) on chain-mode objects are rejected;
+	 * callers must construct a signed Change and submit via pushChanges.
+	 */
+	chainMode?: boolean;
 }
 
 /** A loaded program ready for dispatch. */
@@ -294,6 +306,10 @@ async function compileModuleProgram(ms: ModuleSet, name: string): Promise<Progra
 		const externals: Record<string, unknown> = {
 			"proto.js": proto,
 			"crypto.js": cryptoMod,
+			"det/canonical.js": detCanonical,
+			"det/math.js": detMath,
+			"det/ed25519.js": detEd25519,
+			"det/index.js": det,
 		};
 		const factory = new Function(bundled);
 		// Node built-ins go through the real require, scoped to node: prefix only
@@ -379,6 +395,7 @@ async function extractModuleSet(
 // ── Validator registry ──────────────────────────────────────────
 
 const validators = new Map<string, ValidatorFn>();
+const chainModeTypes = new Set<string>();
 
 /** Register a validator for one or more type keys. */
 function registerValidator(typeKeys: string[], fn: ValidatorFn): void {
@@ -387,9 +404,19 @@ function registerValidator(typeKeys: string[], fn: ValidatorFn): void {
 	}
 }
 
+/** Mark each type key as chain-mode (requires signed Changes). */
+function registerChainModeTypes(typeKeys: string[]): void {
+	for (const key of typeKeys) chainModeTypes.add(key);
+}
+
 /** Get the validator for a given type key (if any). */
 export function getValidator(typeKey: string): ValidatorFn | undefined {
 	return validators.get(typeKey);
+}
+
+/** Whether a typeKey participates in chain consensus (signature gate, validator dispatch). */
+export function isChainModeType(typeKey: string): boolean {
+	return chainModeTypes.has(typeKey);
 }
 
 // ── Program actor instances ─────────────────────────────────────
@@ -508,8 +535,9 @@ export async function loadPrograms(
 	const refs = await store.list("program");
 	const programs: ProgramEntry[] = [];
 
-	// Clear previous validator registrations
+	// Clear previous validator and chain-mode registrations.
 	validators.clear();
+	chainModeTypes.clear();
 
 	for (const ref of refs) {
 		let obj: any;
@@ -540,6 +568,9 @@ export async function loadPrograms(
 		// Register validator if present
 		if (def.validator && def.validatedTypes?.length) {
 			registerValidator(def.validatedTypes, def.validator);
+		}
+		if (def.chainMode && def.validatedTypes?.length) {
+			registerChainModeTypes(def.validatedTypes);
 		}
 
 		// Build the handler: prefer def.handler, fall back to actor dispatch help text
