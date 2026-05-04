@@ -194,20 +194,20 @@ async function buildAnchor(
 
 	const reward = computeReward(height);
 
-	const fields: Record<string, unknown> = {
-		height,
-		previous_anchor: previousAnchorId,
-		merkle_root: root,
-		timestamp: Date.now(),
-		creator: opts.creator ?? "system",
-		commit_count: commits.length,
-		commits_json: JSON.stringify(commits),
-		vdf_output: opts.vdfProof ? JSON.stringify(opts.vdfProof) : "",
-		plot_proof: opts.plotProof ?? "",
-		plot_quality: opts.plotQuality ?? 0,
-		reward_pubkey: opts.rewardPubkey ?? "",
-		reward_amount: String(reward),
-	};
+    const fields = {
+        height: ctx.intVal(height),
+        previous_anchor: ctx.stringVal(previousAnchorId),
+        merkle_root: ctx.stringVal(root),
+        timestamp: ctx.intVal(Date.now()),
+        creator: ctx.stringVal(opts.creator ?? "system"),
+        commit_count: ctx.intVal(commits.length),
+        commits_json: ctx.stringVal(JSON.stringify(commits)),
+        vdf_output: ctx.stringVal(opts.vdfProof ? JSON.stringify(opts.vdfProof) : ""),
+        plot_proof: ctx.stringVal(opts.plotProof ?? ""),
+        plot_quality: ctx.intVal(opts.plotQuality ?? 0),
+        reward_pubkey: ctx.stringVal(opts.rewardPubkey ?? ""),
+        reward_amount: ctx.intVal(reward),
+    };
 
 	const id = (await store.create(ANCHOR_TYPE_KEY, JSON.stringify(fields))) as string;
 	return { id, root, commits, reward };
