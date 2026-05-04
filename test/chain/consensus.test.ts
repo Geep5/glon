@@ -8,7 +8,7 @@
  *     fee minimums per kind, state advancement, purity
  *   - validator (batch form): rejects on first invalid change in a batch,
  *     advances state across multiple changes
- *   - validateFully: dispatches to /token.validate_op via mock dispatchProgram
+ *   - validateFully: dispatches to /coin.validate_op via mock dispatchProgram
  *   - actor actions: status / getNonce / recordAccepted / setBaseFee
  *
  * Run: npx tsx --test test/chain/consensus.test.ts
@@ -18,7 +18,6 @@ import { describe, it, beforeEach } from "node:test";
 import { strict as assert } from "node:assert";
 import consensusProgram, { __test, DEFAULT_BASE_FEE, DEPLOY_FEE_MULTIPLIER, MINT_FEE_MULTIPLIER } from "../../src/programs/handlers/consensus.js";
 import type { Change } from "../../src/proto.js";
-import { __test as tokenTest, OP_CONTENT_TYPE } from "../../src/programs/handlers/token.js";
 
 const {
 	classifyForFee,
@@ -30,10 +29,6 @@ const {
 	resetMirror,
 } = __test;
 
-const { buildDeployChange, buildOpChange } = tokenTest;
-
-// ── Fixtures ────────────────────────────────────────────────────
-
 const ALICE_PUB_HEX = "a".repeat(64);
 const BOB_PUB_HEX = "b".repeat(64);
 
@@ -42,48 +37,83 @@ function alicePub(): Uint8Array {
 }
 
 function deployChange(opts?: { nonce?: number; fee?: number }): Change {
-	const c = buildDeployChange({
-		tokenId: "tok-1", timestamp: 1, author: "test",
-		name: "TestCoin", symbol: "TST", decimals: 6,
-		ownerPubkeyHex: ALICE_PUB_HEX, initialSupply: 1000n,
-	});
-	c.authorSig = {
-		pubkey: alicePub(),
-		signature: new Uint8Array(64),
-		nonce: opts?.nonce ?? 1,
-		fee: opts?.fee ?? Number(DEFAULT_BASE_FEE * DEPLOY_FEE_MULTIPLIER),
+	const c: Change = {
+		id: new Uint8Array(0),
+		objectId: "bucket-1",
+		parentIds: [],
+		ops: [{ objectCreate: { typeKey: "chain.coin.bucket" } }],
+		timestamp: 1,
+		author: "test",
+		authorSig: {
+			pubkey: alicePub(),
+			signature: new Uint8Array(64),
+			nonce: opts?.nonce ?? 1,
+			fee: opts?.fee ?? Number(DEFAULT_BASE_FEE * DEPLOY_FEE_MULTIPLIER),
+		},
 	};
 	return c;
 }
 
 function transferChange(opts?: { nonce?: number; fee?: number }): Change {
-	const c = buildOpChange({
-		tokenId: "tok-1", parentIds: [], timestamp: 2, author: "test",
-		op: { kind: "Transfer", to: BOB_PUB_HEX, amount: "10" },
-		signerPubkeyHex: ALICE_PUB_HEX,
-		blockId: "blk-x",
-	});
-	c.authorSig = {
-		pubkey: alicePub(),
-		signature: new Uint8Array(64),
-		nonce: opts?.nonce ?? 2,
-		fee: opts?.fee ?? Number(DEFAULT_BASE_FEE),
+	const c: Change = {
+		id: new Uint8Array(0),
+		objectId: "bucket-1",
+		parentIds: [],
+		ops: [{
+			blockAdd: {
+				parentId: "", afterId: "",
+				block: {
+					id: "blk-x", childrenIds: [],
+					content: {
+						custom: {
+							contentType: "chain.coin.op",
+							data: new Uint8Array(),
+							meta: { op: "create", coin_id: "c1", owner_pubkey: BOB_PUB_HEX, amount: "10" },
+						},
+					},
+				},
+			},
+		}],
+		timestamp: 2,
+		author: "test",
+		authorSig: {
+			pubkey: alicePub(),
+			signature: new Uint8Array(64),
+			nonce: opts?.nonce ?? 2,
+			fee: opts?.fee ?? Number(DEFAULT_BASE_FEE),
+		},
 	};
 	return c;
 }
 
 function mintChange(opts?: { nonce?: number; fee?: number }): Change {
-	const c = buildOpChange({
-		tokenId: "tok-1", parentIds: [], timestamp: 3, author: "test",
-		op: { kind: "Mint", to: BOB_PUB_HEX, amount: "5" },
-		signerPubkeyHex: ALICE_PUB_HEX,
-		blockId: "blk-mint",
-	});
-	c.authorSig = {
-		pubkey: alicePub(),
-		signature: new Uint8Array(64),
-		nonce: opts?.nonce ?? 3,
-		fee: opts?.fee ?? Number(DEFAULT_BASE_FEE * MINT_FEE_MULTIPLIER),
+	const c: Change = {
+		id: new Uint8Array(0),
+		objectId: "bucket-1",
+		parentIds: [],
+		ops: [{
+			blockAdd: {
+				parentId: "", afterId: "",
+				block: {
+					id: "blk-mint", childrenIds: [],
+					content: {
+						custom: {
+							contentType: "chain.coin.op",
+							data: new Uint8Array(),
+							meta: { op: "Mint", coin_id: "c2", owner_pubkey: BOB_PUB_HEX, amount: "5" },
+						},
+					},
+				},
+			},
+		}],
+		timestamp: 3,
+		author: "test",
+		authorSig: {
+			pubkey: alicePub(),
+			signature: new Uint8Array(64),
+			nonce: opts?.nonce ?? 3,
+			fee: opts?.fee ?? Number(DEFAULT_BASE_FEE * MINT_FEE_MULTIPLIER),
+		},
 	};
 	return c;
 }
@@ -103,7 +133,7 @@ describe("classifyForFee", () => {
 		assert.equal(classifyForFee(deployChange()), "Deploy");
 	});
 
-	it("Mint when BlockAdd carries chain.token.op meta.op=Mint", () => {
+	it("Mint when BlockAdd carries meta.op=Mint", () => {
 		assert.equal(classifyForFee(mintChange()), "Mint");
 	});
 
@@ -117,7 +147,7 @@ describe("classifyForFee", () => {
 			ops: [{ blockAdd: {
 				parentId: "", afterId: "",
 				block: { id: "b", childrenIds: [], content: { custom: {
-					contentType: OP_CONTENT_TYPE, data: new Uint8Array(), meta: { foo: "bar" },
+					contentType: "chain.coin.op", data: new Uint8Array(), meta: { foo: "bar" },
 				} } },
 			} }],
 			timestamp: 0, author: "t",
@@ -279,7 +309,7 @@ describe("validateFully", () => {
 		const dispatchCalls: any[] = [];
 		const ctx = {
 			store: {
-				get: async (_id: string) => ({ typeKey: opts.typeKey ?? "chain.token", fields: {}, blocks: [] }),
+				get: async (_id: string) => ({ typeKey: opts.typeKey ?? "chain.coin.bucket", fields: {}, blocks: [] }),
 			},
 			dispatchProgram: async (prefix: string, action: string, args: any[]) => {
 				dispatchCalls.push({ prefix, action, args });
@@ -290,36 +320,36 @@ describe("validateFully", () => {
 		return { ctx, dispatchCalls };
 	}
 
-	it("dispatches to /token.validate_op for chain.token", async () => {
+	it("dispatches to /coin.validate_op for chain.coin.bucket", async () => {
 		const { ctx, dispatchCalls } = makeCtx({});
-		const r = await validateFully(deployChange(), "tok-1", emptyState(), ctx);
+		const r = await validateFully(deployChange(), "bucket-1", emptyState(), ctx);
 		assert.equal(r.ok, true);
 		assert.equal(dispatchCalls.length, 1);
-		assert.equal(dispatchCalls[0].prefix, "/token");
+		assert.equal(dispatchCalls[0].prefix, "/coin");
 		assert.equal(dispatchCalls[0].action, "validate_op");
-		assert.equal(dispatchCalls[0].args[0].tokenId, "tok-1");
+		assert.equal(dispatchCalls[0].args[0].bucketId, "bucket-1");
 	});
 
 	it("returns the consensus failure WITHOUT dispatching when gate fails", async () => {
 		const { ctx, dispatchCalls } = makeCtx({});
 		const c = deployChange({ fee: 0 });
-		const r = await validateFully(c, "tok-1", emptyState(), ctx);
+		const r = await validateFully(c, "bucket-1", emptyState(), ctx);
 		assert.equal(r.ok, false);
 		assert.equal(dispatchCalls.length, 0, "must not dispatch when gate fails");
 	});
 
 	it("propagates the type-validator's reason on semantic rejection", async () => {
 		const { ctx } = makeCtx({
-			dispatchHandler: () => ({ valid: false, error: "token op: insufficient balance" }),
+			dispatchHandler: () => ({ valid: false, error: "coin op: double spend" }),
 		});
-		const r = await validateFully(transferChange(), "tok-1", emptyState(), ctx);
+		const r = await validateFully(transferChange(), "bucket-1", emptyState(), ctx);
 		assert.equal(r.ok, false);
-		assert.match((r as any).reason, /insufficient balance/);
+		assert.match((r as any).reason, /double spend/);
 	});
 
 	it("rejects when no dispatch is registered for the typeKey", async () => {
 		const { ctx } = makeCtx({ typeKey: "chain.unknown" });
-		const r = await validateFully(deployChange(), "tok-1", emptyState(), ctx);
+		const r = await validateFully(deployChange(), "bucket-1", emptyState(), ctx);
 		assert.equal(r.ok, false);
 		assert.match((r as any).reason, /no dispatch/);
 	});
@@ -329,7 +359,7 @@ describe("validateFully", () => {
 			store: { get: async () => null },
 			dispatchProgram: async () => ({ valid: true }),
 		} as any;
-		const r = await validateFully(deployChange(), "tok-1", emptyState(), ctx);
+		const r = await validateFully(deployChange(), "bucket-1", emptyState(), ctx);
 		assert.equal(r.ok, true);
 	});
 });
@@ -337,8 +367,8 @@ describe("validateFully", () => {
 // ── Program registration ────────────────────────────────────────
 
 describe("program registration", () => {
-	it("declares chain.token in validatedTypes", () => {
-		assert.deepEqual(consensusProgram.validatedTypes, ["chain.token"]);
+	it("declares chain.coin.bucket in validatedTypes", () => {
+		assert.deepEqual(consensusProgram.validatedTypes, ["chain.coin.bucket"]);
 		assert.equal(typeof consensusProgram.validator, "function");
 	});
 

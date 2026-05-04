@@ -19,3 +19,15 @@ dist/
 ask-agent-about-architecture.sh
 check-agent-history.sh
 tell-agent-truth.sh
+
+	# Runtime artifacts
+	.glon-data/
+	*.log
+	*.pid
+	server.pid
+	dev-server.log
+	daemon-test.log
+
+	# Screenshots / docs drafts
+	*.png
+	UTXO_REVAMP.md

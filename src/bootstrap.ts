@@ -41,7 +41,6 @@ const SOURCES = [
 	"src/programs/handlers/agent.ts",
 	"src/programs/handlers/task.ts",
 	"src/programs/handlers/gc.ts",
-	"src/programs/handlers/accounts.ts",
 	"src/programs/handlers/sync.ts",
 	"src/programs/handlers/graph.ts",
 	"src/programs/handlers/peer.ts",
@@ -61,7 +60,6 @@ const SOURCES = [
 	"src/det/math.ts",
 	"src/det/ed25519.ts",
 	"src/programs/handlers/wallet.ts",
-	"src/programs/handlers/token.ts",
 	"src/programs/handlers/consensus.ts",
 	"src/programs/handlers/anchor.ts",
 	"src/programs/handlers/plot.ts",
@@ -225,22 +223,6 @@ const PROGRAMS: ProgramDef[] = [
 		modules: { "gc.ts": "src/programs/handlers/gc.ts" },
 	},
 	{
-		prefix: "/accounts",
-		name: "Accounts & Permissions",
-		commands: {
-			whoami: "Show current user",
-			login: "Login as user",
-			logout: "Logout",
-			create: "Create account",
-			list: "List all accounts",
-			grant: "Grant permission",
-			revoke: "Revoke permission",
-			check: "Check permission",
-		},
-		entry: "accounts.ts",
-		modules: { "accounts.ts": "src/programs/handlers/accounts.ts" },
-	},
-	{
 		prefix: "/sync",
 		name: "P2P Sync",
 		commands: {
@@ -384,17 +366,6 @@ const PROGRAMS: ProgramDef[] = [
 		},
 		entry: "wallet.ts",
 		modules: { "wallet.ts": "src/programs/handlers/wallet.ts" },
-	},
-	{
-		prefix: "/token",
-		name: "Token",
-		commands: {
-			info: "Show metadata + supply + owner for one token",
-			balance: "Show one holder's balance",
-			holders: "List balances, descending",
-		},
-		entry: "token.ts",
-		modules: { "token.ts": "src/programs/handlers/token.ts" },
 	},
 	{
 		prefix: "/coin",

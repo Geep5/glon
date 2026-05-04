@@ -41,7 +41,7 @@ function makeRichChange(mapInsertOrder: string[] = ["a", "b", "c"]): Change {
 		objectId: "obj-1",
 		parentIds: [new Uint8Array([1, 2, 3])],
 		ops: [
-			{ objectCreate: { typeKey: "chain.token" } },
+			{ objectCreate: { typeKey: "chain.coin.bucket" } },
 			{
 				fieldSet: {
 					key: "metadata",
@@ -66,7 +66,7 @@ function makeRichChange(mapInsertOrder: string[] = ["a", "b", "c"]): Change {
 						childrenIds: [],
 						content: {
 							custom: {
-								contentType: "chain.token.op",
+								contentType: "chain.coin.bucket.op",
 								data: new Uint8Array(),
 								meta: { op: "Mint", to: "alice", amount: "1000" },
 							},
@@ -177,7 +177,7 @@ describe("canonicalEncodeChange", () => {
 				objectId: "obj-1",
 				parentIds: [new Uint8Array([1, 2, 3])],
 				ops: [
-					{ objectCreate: { typeKey: "chain.token" } },
+					{ objectCreate: { typeKey: "chain.coin.bucket" } },
 					{ fieldSet: { key: "metadata", value: mapVal(fields) } },
 					{ fieldSet: { key: "nested_list", value: listVal([
 						mapVal({ x: stringVal("1"), y: stringVal("2") }),
@@ -185,7 +185,7 @@ describe("canonicalEncodeChange", () => {
 					]) } },
 					{ blockAdd: { parentId: "", afterId: "", block: {
 						id: "blk-1", childrenIds: [],
-						content: { custom: { contentType: "chain.token.op", data: new Uint8Array(),
+						content: { custom: { contentType: "chain.coin.bucket.op", data: new Uint8Array(),
 							meta: { op: "Mint", to: "alice", amount: "1000" } } },
 					} } },
 				],

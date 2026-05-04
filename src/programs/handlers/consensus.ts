@@ -17,7 +17,7 @@
 //      Floor multipliers are constants in v1; the absolute base is a
 //      configurable knob (per-anchor adjustment is v2).
 //   5. Type-specific semantic validation, dispatched to the owning
-//      program's validate_op actor action (e.g. /token.validate_op).
+	//      program's validate_op actor action (e.g. /coin.validate_op).
 //
 // Persistent state:
 //   - nonces: Map<pubkey_hex, uint64> last-seen nonce per pubkey.
@@ -73,7 +73,6 @@ export const MINT_FEE_MULTIPLIER = 10n;
  * Adding a new chain-mode type is one entry here plus the program.
  */
 const TYPE_DISPATCH: Record<string, { prefix: string; action: string; idKey: string }> = {
-	"chain.token": { prefix: "/token", action: "validate_op", idKey: "tokenId" },
 	"chain.coin.bucket": { prefix: "/coin", action: "validate_op", idKey: "bucketId" },
 };
 
@@ -83,10 +82,10 @@ const TYPE_DISPATCH: Record<string, { prefix: string; action: string; idKey: str
  * A coarse classification of a Change's intent, used only to pick the
  * right fee minimum. Type-specific semantic validation runs after this.
  *
- * For chain.token:
+	 * For chain-mode objects:
  *   - Deploy: any Change with an objectCreate op
- *   - Mint:   BlockAdd with chain.token.op meta.op="Mint"
- *   - other:  everything else (Transfer, Burn, Approve, TransferFrom, RenounceMint)
+	 *   - Mint:   BlockAdd with meta.op="Mint"
+	 *   - other:  everything else (transfers, burns, etc.)
  *
  * Future chain types can extend this without changing the gate logic;
  * unrecognized changes default to "other" (the cheapest tier).
@@ -156,7 +155,7 @@ function feePolicyOf(s: PersistedState): FeePolicy {
  * pubkey's nonce advanced) and a kind tag so the caller can dispatch
  * semantic validation.
  *
- * Does NOT call /token or any other type-specific validator. The caller
+	 * Does NOT call /coin or any other type-specific validator. The caller
  * does that after this returns ok.
  */
 export function consensusGate(
@@ -430,7 +429,7 @@ const program: ProgramDef = {
 		// maintains. See the 'Async semantic dispatch' note above.
 		return MIRROR_STATE;
 	}),
-	validatedTypes: ["chain.token", "chain.coin.bucket"],
+	validatedTypes: ["chain.coin.bucket"],
 };
 export default program;
 

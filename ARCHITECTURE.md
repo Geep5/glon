@@ -133,7 +133,7 @@ Write paths: `upsert_fact`, `upsert_milestone`, `amend_milestone`. Read paths: `
 
 ## Crypto Layer
 
-A signed-token chain on the same per-actor DAG primitives. Four programs (`/wallet`, `/token`, `/coin`, `/consensus`) plus a kernel-level signature gate.
+A signed-token chain on the same per-actor DAG primitives. Three programs (`/wallet`, `/coin`, `/consensus`) plus a kernel-level signature gate.
 
 ### Trust model
 
@@ -168,13 +168,6 @@ Local-only; **not** chain-mode. `${GLON_DATA}/wallet.json` (mode 0600), atomic w
 
 Exposes `signChange({name, changeB64, nonce, fee})` — decodes, fills `authorSig`, computes canonical signing payload, signs, computes id, returns signed Change as base64. Private material exposed by no action.
 
-### `/token` — Account Model (legacy)
-
-One `chain.token` object per token.
-- Fields: `name`, `symbol`, `decimals`, `owner_pubkey`, `initial_supply`, `storage_credit`.
-- Ops as `CustomContent` blocks (`contentType: "chain.token.op"`).
-- State (balances, allowances, totalSupply) derived by replaying `fields + blocks`.
-- Six ops: `Mint`, `Transfer`, `Approve`, `TransferFrom`, `Burn`, `RenounceMint`.
 
 Scales as O(total tx history) per balance query because the entire DAG must be replayed.
 
@@ -218,7 +211,7 @@ Pipeline per chain-mode Change (after kernel signature gate):
 ```
 kernel pushChanges
   ├─ Ed25519 sig verified, change.id matches canonical hash
-  └─ getValidator("chain.token") → /consensus validator
+	  └─ getValidator("chain.coin.bucket") → /consensus validator
        ├─ nonce > last seen for pubkey?
        └─ fee >= minimumFee?
             Deploy: base × 100
@@ -227,8 +220,7 @@ kernel pushChanges
        └─ on accept: nonce state advances
 
 async follow-up:
-  └─ dispatchProgram("/token", "validate_op", ...)  OR
-     dispatchProgram("/coin", "validate_op", ...)
+	  └─ dispatchProgram("/coin", "validate_op", ...)
        └─ replays prior state, applies op to clone, checks invariants
 ```
 

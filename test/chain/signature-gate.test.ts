@@ -99,13 +99,13 @@ function runSignatureGate(change: Change): { ok: true } | { ok: false; reason: s
 describe("signature gate", () => {
 	it("accepts a properly signed Change", () => {
 		const keys = generateKeyPair();
-		const ch = signChange(unsignedChange("obj-1", "chain.token"), keys, 1, 10);
+		const ch = signChange(unsignedChange("obj-1", "chain.coin.bucket"), keys, 1, 10);
 		const result = runSignatureGate(ch);
 		assert.equal(result.ok, true);
 	});
 
 	it("rejects a Change missing author_sig", () => {
-		const ch = unsignedChange("obj-1", "chain.token");
+		const ch = unsignedChange("obj-1", "chain.coin.bucket");
 		ch.id = sha256(canonicalEncodeChange(ch));
 		const result = runSignatureGate(ch);
 		assert.equal(result.ok, false);
@@ -114,7 +114,7 @@ describe("signature gate", () => {
 
 	it("rejects a Change with empty pubkey on author_sig", () => {
 		const ch: Change = {
-			...unsignedChange("obj-1", "chain.token"),
+			...unsignedChange("obj-1", "chain.coin.bucket"),
 			authorSig: {
 				pubkey: new Uint8Array(0),
 				signature: new Uint8Array(64),
@@ -129,7 +129,7 @@ describe("signature gate", () => {
 
 	it("rejects a Change with a wrong-length pubkey", () => {
 		const ch: Change = {
-			...unsignedChange("obj-1", "chain.token"),
+			...unsignedChange("obj-1", "chain.coin.bucket"),
 			authorSig: {
 				pubkey: new Uint8Array(31),  // off by one
 				signature: new Uint8Array(64),
@@ -145,7 +145,7 @@ describe("signature gate", () => {
 
 	it("rejects a Change with a tampered signature", () => {
 		const keys = generateKeyPair();
-		const ch = signChange(unsignedChange("obj-1", "chain.token"), keys, 1, 10);
+		const ch = signChange(unsignedChange("obj-1", "chain.coin.bucket"), keys, 1, 10);
 		// Flip one byte of the signature.
 		ch.authorSig!.signature[0] ^= 0x01;
 		// Recompute id with the tampered sig (otherwise the id check fails first).
@@ -158,7 +158,7 @@ describe("signature gate", () => {
 	it("rejects a Change signed by a different key (substituted pubkey)", () => {
 		const aliceKeys = generateKeyPair();
 		const bobKeys = generateKeyPair();
-		const ch = signChange(unsignedChange("obj-1", "chain.token"), aliceKeys, 1, 10);
+		const ch = signChange(unsignedChange("obj-1", "chain.coin.bucket"), aliceKeys, 1, 10);
 		// Replace pubkey with bob's; signature was made by alice so verify must fail.
 		ch.authorSig!.pubkey = bobKeys.publicKey;
 		ch.id = sha256(canonicalEncodeChange(ch));
@@ -169,7 +169,7 @@ describe("signature gate", () => {
 
 	it("rejects a Change whose id doesn't match the canonical hash", () => {
 		const keys = generateKeyPair();
-		const ch = signChange(unsignedChange("obj-1", "chain.token"), keys, 1, 10);
+		const ch = signChange(unsignedChange("obj-1", "chain.coin.bucket"), keys, 1, 10);
 		// Tamper with id only — signature is still valid but id no longer matches.
 		ch.id = new Uint8Array(32).fill(0xff);
 		const result = runSignatureGate(ch);
@@ -179,7 +179,7 @@ describe("signature gate", () => {
 
 	it("changing the fee after signing invalidates the signature", () => {
 		const keys = generateKeyPair();
-		const ch = signChange(unsignedChange("obj-1", "chain.token"), keys, 1, 10);
+		const ch = signChange(unsignedChange("obj-1", "chain.coin.bucket"), keys, 1, 10);
 		// User tries to pay less than they signed for.
 		ch.authorSig!.fee = 5;
 		ch.id = sha256(canonicalEncodeChange(ch));
@@ -190,7 +190,7 @@ describe("signature gate", () => {
 
 	it("changing the nonce after signing invalidates the signature", () => {
 		const keys = generateKeyPair();
-		const ch = signChange(unsignedChange("obj-1", "chain.token"), keys, 1, 10);
+		const ch = signChange(unsignedChange("obj-1", "chain.coin.bucket"), keys, 1, 10);
 		ch.authorSig!.nonce = 99;
 		ch.id = sha256(canonicalEncodeChange(ch));
 		const result = runSignatureGate(ch);
@@ -200,7 +200,7 @@ describe("signature gate", () => {
 
 	it("changing an op payload after signing invalidates the signature", () => {
 		const keys = generateKeyPair();
-		const ch = signChange(unsignedChange("obj-1", "chain.token"), keys, 1, 10);
+		const ch = signChange(unsignedChange("obj-1", "chain.coin.bucket"), keys, 1, 10);
 		// Add an op the signer didn't authorize.
 		ch.ops.push({ fieldSet: { key: "evil", value: { stringValue: "yes" } } });
 		ch.id = sha256(canonicalEncodeChange(ch));

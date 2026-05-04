@@ -157,7 +157,7 @@ describe("wallet key management", () => {
 describe("wallet signing", () => {
 	it("signChange produces a verifiable signature over canonical(change)", () => {
 		const r = doNew("alice", 1, tmpPath);
-		const ch = unsignedChange("obj-1", "chain.token");
+		const ch = unsignedChange("obj-1", "chain.coin.bucket");
 		const encoded = encodeChange(ch);
 		const result = doSignChange({
 			name: "alice",
@@ -187,7 +187,7 @@ describe("wallet signing", () => {
 	});
 
 	it("signChange rejects unknown wallet name", () => {
-		const ch = unsignedChange("obj-1", "chain.token");
+		const ch = unsignedChange("obj-1", "chain.coin.bucket");
 		assert.throws(() => doSignChange({
 			name: "nobody",
 			changeB64: Buffer.from(encodeChange(ch)).toString("base64"),
@@ -197,7 +197,7 @@ describe("wallet signing", () => {
 
 	it("signChange rejects nonce < 1", () => {
 		doNew("alice", 1, tmpPath);
-		const ch = unsignedChange("obj-1", "chain.token");
+		const ch = unsignedChange("obj-1", "chain.coin.bucket");
 		assert.throws(() => doSignChange({
 			name: "alice",
 			changeB64: Buffer.from(encodeChange(ch)).toString("base64"),
@@ -207,7 +207,7 @@ describe("wallet signing", () => {
 
 	it("signChange rejects negative fee", () => {
 		doNew("alice", 1, tmpPath);
-		const ch = unsignedChange("obj-1", "chain.token");
+		const ch = unsignedChange("obj-1", "chain.coin.bucket");
 		assert.throws(() => doSignChange({
 			name: "alice",
 			changeB64: Buffer.from(encodeChange(ch)).toString("base64"),
@@ -218,7 +218,7 @@ describe("wallet signing", () => {
 	it("two distinct keys produce independently verifiable signatures", () => {
 		const aliceR = doNew("alice", 1, tmpPath);
 		const bobR = doNew("bob", 2, tmpPath);
-		const ch = unsignedChange("obj-1", "chain.token");
+		const ch = unsignedChange("obj-1", "chain.coin.bucket");
 		const encoded = Buffer.from(encodeChange(ch)).toString("base64");
 
 		const aliceSig = doSignChange({ name: "alice", changeB64: encoded, nonce: 1, fee: 0 }, tmpPath);
@@ -248,7 +248,7 @@ describe("wallet signing", () => {
 			objectId: "obj-7",
 			parentIds: [new Uint8Array([0xab, 0xcd])],
 			ops: [
-				{ objectCreate: { typeKey: "chain.token" } },
+				{ objectCreate: { typeKey: "chain.coin.bucket" } },
 				{ fieldSet: { key: "name", value: { stringValue: "TestCoin" } } },
 			],
 			timestamp: 1234567890,

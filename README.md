@@ -38,7 +38,7 @@ Five kernel primitives:
 | **Objects, not files** | No folders, no tree. Typed entities in a flat graph linked via `ObjectLink` fields. Structure emerges from connections. |
 | **Changes, not state** | Every mutation is a `Change` protobuf, content-addressed by SHA-256, appended to a DAG. State is computed by replay. |
 | **Actors, not databases** | Each object is a Rivet actor. `objectActor` (one per object), `storeActor` (singleton index), `programActor` (state + RPC). |
-| **Everything is a program** | Zero built-in commands. `/help`, `/crud`, `/agent`, `/token` — all loaded from the store at startup. |
+	| **Everything is a program** | Zero built-in commands. `/help`, `/crud`, `/agent`, `/coin` — all loaded from the store at startup. |
 | **Self-describing** | Bootstrap seeds the source files as objects into the store. Query glon for the code that built it. |
 
 Programs export a `ProgramDef`:
@@ -48,7 +48,7 @@ export default {
   handler: async (cmd, args, ctx) => { ... },  // CLI
   actor: { createState: () => ({}), actions: { ... }, tickMs: 5000 },
   validator: (changes) => { return { valid: true }; },
-  validatedTypes: ["chain.token"],
+	  validatedTypes: ["chain.coin.bucket"],
   chainMode: true,  // require Ed25519 signed Changes
 };
 ```
@@ -68,7 +68,6 @@ export default {
 | `/holdfast` | Agent harness: identity-aware ingest + memory + reminders + shell + subagents |
 | `/wallet` | Local-only Ed25519 keychain |
 | `/coin` | **UTXO-based fungible tokens** (recommended for new tokens) |
-| `/token` | Account-model fungible tokens (legacy) |
 | `/consensus` | Validator gate for chain-mode: nonce + fee + semantic checks |
 | `/anchor` | State commitment + PoST gate + inflation rewards |
 | `/plot` | Proof of Space (chiapos) |
@@ -136,7 +135,7 @@ glon> /agent tree c07aa4d3
 
 ## Crypto
 
-A signed-token chain layered on the same per-actor DAG primitives. Four programs (`/wallet`, `/token`, `/coin`, `/consensus`) plus a kernel-level Ed25519 signature gate.
+A signed-token chain layered on the same per-actor DAG primitives. Three programs (`/wallet`, `/coin`, `/consensus`) plus a kernel-level Ed25519 signature gate.
 
 | Feature | Primitive |
 |---|---|
@@ -169,11 +168,6 @@ glon> /coin balance 90c86a5a... a1b2c3d4...
   FIG  750
 ```
 
-### `/token` — account model (legacy)
-
-- One `chain.token` object per token. Balances derived by replaying the full op history.
-- Six ops: `Mint`, `Transfer`, `Approve`, `TransferFrom`, `Burn`, `RenounceMint`.
-- Fine for small-scale use; `/coin` scales better because balance queries are O(unspent coins) via SQLite rather than O(total tx history).
 
 ### `/anchor` — state commitment
 

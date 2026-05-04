@@ -13,7 +13,7 @@
 //      fully-formed signed Change with content-addressed `id` filled in.
 //
 // What the wallet does NOT do:
-//   - Construct token operations (that's /token's job)
+	//   - Construct token operations (that's /coin's job)
 //   - Maintain on-chain state (the wallet is local; on-chain identity is
 //     just the raw pubkey)
 //   - Verify signatures (the kernel does that on push)
@@ -289,7 +289,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				`    ${cyan("wallet list")}                  list keys (no private material shown)`,
 				`    ${cyan("wallet show")} ${dim("<name>")}       show one key's pubkey + creation time`,
 				`    ${cyan("wallet remove")} ${dim("<name>")}     forget a key (no key recovery — back up first)`,
-				dim(`  Signing happens via the actor API; /token uses it to construct signed Changes.`),
+				dim(`  Signing happens via the actor API; /coin uses it to construct signed Changes.`),
 				dim(`  Storage: ${walletFilePath()} (mode 0600).`),
 			].join("\n"));
 		}
