@@ -95,8 +95,33 @@ describe("anchor / verifyMerkleRoot", () => {
 	});
 });
 
+describe("anchor / inflation rewards", () => {
+	it("computeReward returns base reward at height 0", () => {
+		const reward = __test.computeReward(0);
+		assert.strictEqual(reward, __test.BASE_REWARD_UNITS);
+	});
+
+	it("computeReward halves after HALVING_INTERVAL", () => {
+		const before = __test.computeReward(__test.HALVING_INTERVAL - 1);
+		const after = __test.computeReward(__test.HALVING_INTERVAL);
+		assert.strictEqual(before, __test.BASE_REWARD_UNITS);
+		assert.strictEqual(after, __test.BASE_REWARD_UNITS / 2);
+	});
+
+	it("computeReward halves twice after 2*HALVING_INTERVAL", () => {
+		const reward = __test.computeReward(__test.HALVING_INTERVAL * 2);
+		assert.strictEqual(reward, __test.BASE_REWARD_UNITS / 4);
+	});
+
+	it("computeReward never goes below MIN_REWARD", () => {
+		const reward = __test.computeReward(__test.HALVING_INTERVAL * 100);
+		assert.strictEqual(reward, 1);
+	});
+});
+
 describe("anchor / constants", () => {
 	it("ANCHOR_TYPE_KEY is chain.anchor", () => {
 		assert.strictEqual(ANCHOR_TYPE_KEY, "chain.anchor");
 	});
 });
+

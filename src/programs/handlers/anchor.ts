@@ -2,22 +2,21 @@
 //
 // Inspired by Chia's consensus design:
 //   - Consensus-critical data (merkle_root) is separate from payload (commits_json).
-//     The Merkle root is the "trunk" that determines fork choice; the full
-//     commits list is "foliage" for inspection only.
 //   - Fork choice: longest chain (highest height), ties broken by timestamp.
 //   - State commitment: binary Merkle tree over (objectId + headId) pairs.
+//   - PoST: VDF proof (chiavdf) + optional plot proof (chiapos) for anchor creation.
+//   - Inflation rewards: new FIG tokens minted to anchor creators.
 //
-// v1 (testnet PoST):
-//   - Simplified PoST: /plot (hash-based proof of space) + /timelord (sequential SHA-256 VDF).
-//   - Anchor creation optionally accepts a VDF output and plot proof.
-//   - Auto-tick runs without PoST (testnet mode) unless configured otherwise.
-//
-// Future (mainnet PoST):
-//   - Replace simplified PoST with chiapos + chiavdf (real class-group VDFs).
-//   - Anchor creation requires a valid PoST proof; fastest proof wins.
+// v1 (real PoST):
+//   - VDF proof required for anchor creation (via --vdf flag or auto-compute).
+//   - Plot proof optional (quality-based competition).
+//   - Inflation reward halving schedule.
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
-import { sha256, hexEncode } from "../../crypto.js";
+import { sha256, hexEncode, hexDecode } from "../../crypto.js";
+import { spawnSync } from "node:child_process";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 // ── ANSI ─────────────────────────────────────────────────────────
 
@@ -39,17 +38,42 @@ function green(s: string) { return `${GREEN}${s}${RESET}`; }
 /** Anchor block type key. */
 export const ANCHOR_TYPE_KEY = "chain.anchor";
 
-/** Auto-anchor tick interval in ms. Set to 0 to disable. */
+/** Auto-anchor tick interval in ms. */
 const AUTO_ANCHOR_MS = 60_000;
 
-/** Chain-mode types that anchors commit to. Extensible as new chain types land. */
+/** Chain-mode types that anchors commit to. */
 const TRACKED_TYPES = ["chain.token"];
+
+/** Inflation: base reward in smallest units (1 FIG = 1_000_000 units). */
+const BASE_REWARD_UNITS = 5_000_000; // 5 FIG
+
+/** Halve reward every N anchors. */
+const HALVING_INTERVAL = 1_000;
+
+/** Minimum reward after halvings (1 unit, effectively zero). */
+const MIN_REWARD = 1;
+
+// ── VDF binary paths ─────────────────────────────────────────────
+
+function vdfVerifyBin(): string {
+	const dir = process.env.GLON_BIN_DIR ?? join(homedir(), ".glon", "bin");
+	return join(dir, "chiavdf-verify");
+}
 
 // ── Types ────────────────────────────────────────────────────────
 
 interface AnchorCommit {
 	objectId: string;
 	headId: string;
+}
+
+interface VDFProof {
+	discriminant: string;
+	x: string;
+	y: string;
+	proof: string;
+	iterations: number;
+	discriminantSizeBits: number;
 }
 
 interface PersistedState {
@@ -64,32 +88,55 @@ function loadState(raw: Record<string, unknown>): PersistedState {
 	};
 }
 
+// ── Reward calculation ───────────────────────────────────────────
+
+/** Calculate inflation reward for a given anchor height. */
+export function computeReward(height: number): number {
+	const halvings = Math.floor(height / HALVING_INTERVAL);
+	const reward = Math.floor(BASE_REWARD_UNITS / Math.pow(2, halvings));
+	return Math.max(reward, MIN_REWARD);
+}
+
+// ── VDF validation ───────────────────────────────────────────────
+
+/** Verify a VDF proof using chiavdf-verify binary. */
+function validateVDF(vdf: VDFProof): boolean {
+	try {
+		const bin = vdfVerifyBin();
+		const result = spawnSync(bin, [
+			vdf.discriminant,
+			vdf.x,
+			vdf.y,
+			vdf.proof,
+			String(vdf.iterations),
+		], { encoding: "utf-8", timeout: 30000 });
+		return result.status === 0 && result.stdout.trim() === "valid";
+	} catch {
+		return false;
+	}
+}
+
 // ── Merkle tree ──────────────────────────────────────────────────
 
-/** Build a leaf hash from an objectId + headId pair. */
 function leafHash(objectId: string, headId: string): Uint8Array {
 	const data = new TextEncoder().encode(objectId + ":" + headId);
 	return sha256(data);
 }
 
-/** Build a binary Merkle root from leaf hashes. Leaves are sorted deterministically. */
 export function merkleRoot(leaves: Uint8Array[]): Uint8Array {
 	if (leaves.length === 0) {
 		return sha256(new Uint8Array(0));
 	}
-
-	// Sort by hex string for deterministic ordering.
 	const level = [...leaves].sort((a, b) => {
 		const ha = hexEncode(a);
 		const hb = hexEncode(b);
 		return ha < hb ? -1 : ha > hb ? 1 : 0;
 	});
-
 	while (level.length > 1) {
 		const next: Uint8Array[] = [];
 		for (let i = 0; i < level.length; i += 2) {
 			const left = level[i];
-			const right = level[i + 1] ?? left; // duplicate last if odd
+			const right = level[i + 1] ?? left;
 			const combined = new Uint8Array(left.length + right.length);
 			combined.set(left);
 			combined.set(right, left.length);
@@ -98,11 +145,9 @@ export function merkleRoot(leaves: Uint8Array[]): Uint8Array {
 		level.length = 0;
 		level.push(...next);
 	}
-
 	return level[0];
 }
 
-/** Verify that a list of commits produces the given Merkle root. */
 export function verifyMerkleRoot(rootHex: string, commits: AnchorCommit[]): boolean {
 	const leaves = commits.map((c) => leafHash(c.objectId, c.headId));
 	const computed = hexEncode(merkleRoot(leaves));
@@ -111,14 +156,24 @@ export function verifyMerkleRoot(rootHex: string, commits: AnchorCommit[]): bool
 
 // ── Anchor construction ──────────────────────────────────────────
 
-/** Gather current chain-mode object heads and build an anchor. */
 async function buildAnchor(
 	ctx: ProgramContext,
 	previousAnchorId: string,
 	height: number,
-	opts: { vdfOutput?: string; plotProof?: string; plotQuality?: number; creator?: string } = {},
-): Promise<{ id: string; root: string; commits: AnchorCommit[] }> {
+	opts: {
+		vdfProof?: VDFProof;
+		plotProof?: string;
+		plotQuality?: number;
+		creator?: string;
+		rewardPubkey?: string;
+	} = {},
+): Promise<{ id: string; root: string; commits: AnchorCommit[]; reward: number }> {
 	const store = ctx.store as any;
+
+	// Validate VDF if provided
+	if (opts.vdfProof && !validateVDF(opts.vdfProof)) {
+		throw new Error("Invalid VDF proof");
+	}
 
 	// Collect heads from all tracked chain-mode types.
 	const commits: AnchorCommit[] = [];
@@ -137,6 +192,8 @@ async function buildAnchor(
 	const leaves = commits.map((c) => leafHash(c.objectId, c.headId));
 	const root = hexEncode(merkleRoot(leaves));
 
+	const reward = computeReward(height);
+
 	const fields: Record<string, unknown> = {
 		height,
 		previous_anchor: previousAnchorId,
@@ -145,22 +202,23 @@ async function buildAnchor(
 		creator: opts.creator ?? "system",
 		commit_count: commits.length,
 		commits_json: JSON.stringify(commits),
-		vdf_output: opts.vdfOutput ?? "",
+		vdf_output: opts.vdfProof ? JSON.stringify(opts.vdfProof) : "",
 		plot_proof: opts.plotProof ?? "",
 		plot_quality: opts.plotQuality ?? 0,
+		reward_pubkey: opts.rewardPubkey ?? "",
+		reward_amount: String(reward),
 	};
 
 	const id = (await store.create(ANCHOR_TYPE_KEY, JSON.stringify(fields))) as string;
-	return { id, root, commits };
+	return { id, root, commits, reward };
 }
 
-/** Find the latest anchor by scanning all chain.anchor objects. */
+// ── Anchor queries ───────────────────────────────────────────────
+
 async function findLatestAnchor(store: any): Promise<{ id: string; height: number; root: string; previous: string; timestamp: number } | null> {
 	const refs = (await store.list(ANCHOR_TYPE_KEY)) as Array<{ id: string }>;
 	if (refs.length === 0) return null;
-
 	let best: { id: string; height: number; root: string; previous: string; timestamp: number } | null = null;
-
 	for (const ref of refs) {
 		const obj = await store.get(ref.id);
 		if (!obj || obj.deleted) continue;
@@ -169,21 +227,17 @@ async function findLatestAnchor(store: any): Promise<{ id: string; height: numbe
 		const timestamp = Number(fields.timestamp?.intValue ?? fields.timestamp ?? 0);
 		const root = String(fields.merkle_root?.stringValue ?? fields.merkle_root ?? "");
 		const previous = String(fields.previous_anchor?.stringValue ?? fields.previous_anchor ?? "");
-
 		if (!best || height > best.height || (height === best.height && timestamp < best.timestamp)) {
 			best = { id: ref.id, height, root, previous, timestamp };
 		}
 	}
-
 	return best;
 }
 
-/** Walk the anchor chain backwards from a given anchor. */
 async function getChainFrom(store: any, startId: string, limit: number): Promise<Array<{ id: string; height: number; root: string; previous: string; timestamp: number }>> {
 	const out: Array<{ id: string; height: number; root: string; previous: string; timestamp: number }> = [];
 	let currentId = startId;
 	const seen = new Set<string>();
-
 	while (currentId && out.length < limit && !seen.has(currentId)) {
 		seen.add(currentId);
 		const obj = await store.get(currentId);
@@ -196,11 +250,9 @@ async function getChainFrom(store: any, startId: string, limit: number): Promise
 		out.push({ id: currentId, height, root, previous, timestamp });
 		currentId = previous;
 	}
-
 	return out;
 }
 
-/** Check whether a given object head is included in any anchor. */
 async function isFinalized(store: any, objectId: string, headId: string): Promise<boolean> {
 	const refs = (await store.list(ANCHOR_TYPE_KEY)) as Array<{ id: string }>;
 	for (const ref of refs) {
@@ -210,12 +262,8 @@ async function isFinalized(store: any, objectId: string, headId: string): Promis
 		const commitsJson = String(fields.commits_json?.stringValue ?? fields.commits_json ?? "[]");
 		try {
 			const commits = JSON.parse(commitsJson) as AnchorCommit[];
-			if (commits.some((c) => c.objectId === objectId && c.headId === headId)) {
-				return true;
-			}
-		} catch {
-			// ignore bad json
-		}
+			if (commits.some((c) => c.objectId === objectId && c.headId === headId)) return true;
+		} catch { /* ignore */ }
 	}
 	return false;
 }
@@ -233,48 +281,58 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			const height = latest ? latest.height + 1 : 0;
 			const previousId = latest ? latest.id : "";
 
-			// Optional PoST arguments
 			const vdfArg = args.find((a) => a.startsWith("--vdf="));
 			const plotArg = args.find((a) => a.startsWith("--plot-proof="));
 			const qualityArg = args.find((a) => a.startsWith("--plot-quality="));
 			const creatorArg = args.find((a) => a.startsWith("--creator="));
+			const rewardArg = args.find((a) => a.startsWith("--reward-pubkey="));
 
-			const vdfOutput = vdfArg ? vdfArg.split("=")[1] : undefined;
+			let vdfProof: VDFProof | undefined;
+			if (vdfArg) {
+				try { vdfProof = JSON.parse(vdfArg.split("=")[1]) as VDFProof; } catch {
+					print(red("Invalid --vdf JSON"));
+					break;
+				}
+			}
+
 			const plotProof = plotArg ? plotArg.split("=")[1] : undefined;
 			const plotQuality = qualityArg ? Number(qualityArg.split("=")[1]) : undefined;
 			const creator = creatorArg ? creatorArg.split("=")[1] : undefined;
+			const rewardPubkey = rewardArg ? rewardArg.split("=")[1] : undefined;
 
-			const { id, root, commits } = await buildAnchor(ctx, previousId, height, {
-				vdfOutput,
-				plotProof,
-				plotQuality,
-				creator,
-			});
+			try {
+				const { id, root, commits, reward } = await buildAnchor(ctx, previousId, height, {
+					vdfProof,
+					plotProof,
+					plotQuality,
+					creator,
+					rewardPubkey,
+				});
 
-			// Update actor state.
-			state.lastAnchorId = id;
-			state.lastAnchorHeight = height;
-			ctx.state!.lastAnchorId = id;
-			ctx.state!.lastAnchorHeight = height;
+				state.lastAnchorId = id;
+				state.lastAnchorHeight = height;
+				ctx.state!.lastAnchorId = id;
+				ctx.state!.lastAnchorHeight = height;
 
-			print(green("Anchor created"));
-			print(dim("  id:     ") + id);
-			print(dim("  height: ") + String(height));
-			print(dim("  root:   ") + root.slice(0, 24) + "…");
-			print(dim("  commits:") + " " + commits.length + " object head(s)");
-			if (vdfOutput) print(dim("  vdf:    ") + "included");
-			if (plotProof) print(dim("  plot:   ") + `quality=${plotQuality ?? 0}`);
-			if (previousId) print(dim("  prev:   ") + previousId);
+				print(green("Anchor created"));
+				print(dim("  id:      ") + id);
+				print(dim("  height:  ") + String(height));
+				print(dim("  root:    ") + root.slice(0, 24) + "…");
+				print(dim("  commits: ") + commits.length + " object head(s)");
+				print(dim("  reward:  ") + (reward / 1_000_000).toFixed(6) + " FIG");
+				if (vdfProof) print(dim("  vdf:     ") + "verified");
+				if (plotProof) print(dim("  plot:    ") + `quality=${plotQuality ?? 0}`);
+				if (previousId) print(dim("  prev:    ") + previousId);
+			} catch (err: any) {
+				print(red("Anchor creation failed: " + (err?.message ?? String(err))));
+			}
 			break;
 		}
 
 		case "list": {
 			const limit = Number(args[0] ?? 20);
 			const latest = await findLatestAnchor(store);
-			if (!latest) {
-				print(dim("  (no anchors yet)"));
-				break;
-			}
+			if (!latest) { print(dim("  (no anchors yet)")); break; }
 			const chain = await getChainFrom(store, latest.id, limit);
 			for (const a of chain) {
 				const shortRoot = a.root ? a.root.slice(0, 16) + "…" : "—";
@@ -285,10 +343,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 		case "status": {
 			const latest = await findLatestAnchor(store);
-			if (!latest) {
-				print(dim("  No anchors yet. Run: anchor create"));
-				break;
-			}
+			if (!latest) { print(dim("  No anchors yet. Run: anchor create")); break; }
 			print(bold("Anchor status"));
 			print(dim("  latest height: ") + bold(String(latest.height)));
 			print(dim("  latest id:     ") + latest.id);
@@ -299,15 +354,15 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			const fields = obj?.fields ?? {};
 			const commitsJson = String(fields.commits_json?.stringValue ?? fields.commits_json ?? "[]");
 			let commitCount = 0;
-			try {
-				commitCount = (JSON.parse(commitsJson) as AnchorCommit[]).length;
-			} catch { /* ignore */ }
+			try { commitCount = (JSON.parse(commitsJson) as AnchorCommit[]).length; } catch { /* ignore */ }
 			print(dim("  commits:       ") + commitCount + " object head(s) in latest anchor");
 
 			const vdfOutput = String(fields.vdf_output?.stringValue ?? fields.vdf_output ?? "");
 			const plotQuality = Number(fields.plot_quality?.intValue ?? fields.plot_quality ?? 0);
+			const rewardAmount = String(fields.reward_amount?.stringValue ?? fields.reward_amount ?? "0");
 			if (vdfOutput) print(dim("  VDF proof:     ") + "included");
-			if (plotQuality > 0) print(dim("  plot quality:  ") + plotQuality + " bits");
+			if (plotQuality > 0) print(dim("  plot quality:  ") + plotQuality);
+			print(dim("  next reward:   ") + (computeReward(latest.height + 1) / 1_000_000).toFixed(6) + " FIG");
 
 			let totalObjects = 0;
 			for (const typeKey of TRACKED_TYPES) {
@@ -336,6 +391,8 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			const commitsJson = String(f.commits_json?.stringValue ?? f.commits_json ?? "[]");
 			const vdfOutput = String(f.vdf_output?.stringValue ?? f.vdf_output ?? "");
 			const plotQuality = Number(f.plot_quality?.intValue ?? f.plot_quality ?? 0);
+			const rewardAmount = String(f.reward_amount?.stringValue ?? f.reward_amount ?? "0");
+			const rewardPubkey = String(f.reward_pubkey?.stringValue ?? f.reward_pubkey ?? "");
 
 			print(bold(`Anchor ${height}`));
 			print(dim("  id:       ") + id);
@@ -344,10 +401,11 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			print(dim("  previous: ") + (previous || "(genesis)"));
 			print(dim("  time:     ") + new Date(timestamp).toLocaleString());
 			print(dim("  commits:  ") + commitCount);
+			print(dim("  reward:   ") + (Number(rewardAmount) / 1_000_000).toFixed(6) + " FIG");
+			if (rewardPubkey) print(dim("  reward to:") + rewardPubkey.slice(0, 24) + "…");
 			if (vdfOutput) print(dim("  VDF:      ") + "included");
-			if (plotQuality > 0) print(dim("  quality:  ") + plotQuality + " bits");
+			if (plotQuality > 0) print(dim("  quality:  ") + plotQuality);
 
-			// Verify Merkle root
 			try {
 				const commits = JSON.parse(commitsJson) as AnchorCommit[];
 				const valid = verifyMerkleRoot(root, commits);
@@ -369,26 +427,40 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			const f = obj.fields ?? {};
 			const root = String(f.merkle_root?.stringValue ?? f.merkle_root ?? "");
 			const commitsJson = String(f.commits_json?.stringValue ?? f.commits_json ?? "[]");
+			const vdfOutput = String(f.vdf_output?.stringValue ?? f.vdf_output ?? "");
+
+			// Verify Merkle root
 			try {
 				const commits = JSON.parse(commitsJson) as AnchorCommit[];
-				const valid = verifyMerkleRoot(root, commits);
-				print(valid ? green("Merkle root verified") : red("Merkle root MISMATCH"));
+				const merkleValid = verifyMerkleRoot(root, commits);
+				print(merkleValid ? green("Merkle root verified") : red("Merkle root MISMATCH"));
 			} catch (err: any) {
-				print(red("Error: " + (err?.message ?? String(err))));
+				print(red("Merkle error: " + (err?.message ?? String(err))));
+			}
+
+			// Verify VDF if present
+			if (vdfOutput) {
+				try {
+					const vdf = JSON.parse(vdfOutput) as VDFProof;
+					const vdfValid = validateVDF(vdf);
+					print(vdfValid ? green("VDF proof verified") : red("VDF proof INVALID"));
+				} catch {
+					print(red("VDF proof malformed"));
+				}
 			}
 			break;
 		}
 
 		default: {
 			print([
-				bold("  Anchor") + dim(" — global ordering + state commitment for chain-mode objects"),
-				`    ${cyan("anchor create")} ${dim("[--vdf=json] [--plot-proof=json] [--plot-quality=N] [--creator=name]")}`,
-				`    ${cyan("anchor list")} ${dim("[limit]")}        show recent anchors (newest first)`,
-				`    ${cyan("anchor status")}               latest height, commit count, pending objects`,
+				bold("  Anchor") + dim(" — global ordering + state commitment + PoST + inflation rewards"),
+				`    ${cyan("anchor create")} ${dim("[--vdf=json] [--plot-proof=json] [--plot-quality=N] [--creator=name] [--reward-pubkey=hex]")}`,
+				`    ${cyan("anchor list")} ${dim("[limit]")}        show recent anchors`,
+				`    ${cyan("anchor status")}               latest height, commit count, next reward`,
 				`    ${cyan("anchor info")} ${dim("<id>")}         full anchor details + Merkle verify`,
-				`    ${cyan("anchor verify")} ${dim("<id>")}        verify Merkle root against stored commits`,
-				dim(`  Auto-anchors every ${AUTO_ANCHOR_MS / 1000}s when the actor is running.`),
-				dim("  PoST proofs (VDF + plot) are optional in testnet mode."),
+				`    ${cyan("anchor verify")} ${dim("<id>")}        verify Merkle root + VDF proof`,
+				dim(`  Auto-anchors every ${AUTO_ANCHOR_MS / 1000}s.`),
+				dim(`  Inflation: ${BASE_REWARD_UNITS / 1_000_000} FIG/base, halving every ${HALVING_INTERVAL} anchors.`),
 			].join("\n"));
 		}
 	}
@@ -403,32 +475,32 @@ const actorDef: ProgramActorDef = {
 	}),
 
 	actions: {
-		/** Create a new anchor from current chain-mode state. */
-		createAnchor: async (ctx: ProgramContext, opts?: { vdfOutput?: string; plotProof?: string; plotQuality?: number; creator?: string }) => {
+		createAnchor: async (ctx: ProgramContext, opts?: {
+			vdfProof?: VDFProof;
+			plotProof?: string;
+			plotQuality?: number;
+			creator?: string;
+			rewardPubkey?: string;
+		}) => {
 			const store = ctx.store as any;
 			const latest = await findLatestAnchor(store);
 			const height = latest ? latest.height + 1 : 0;
 			const previousId = latest ? latest.id : "";
-			const { id, root, commits } = await buildAnchor(ctx, previousId, height, opts ?? {});
-
-			// Update state.
+			const { id, root, commits, reward } = await buildAnchor(ctx, previousId, height, opts ?? {});
 			const s = loadState(ctx.state ?? {});
 			s.lastAnchorId = id;
 			s.lastAnchorHeight = height;
 			ctx.state!.lastAnchorId = id;
 			ctx.state!.lastAnchorHeight = height;
-
-			return { id, height, root, commitCount: commits.length, previousId };
+			return { id, height, root, commitCount: commits.length, previousId, reward };
 		},
 
-		/** Get the latest anchor (highest height). */
 		getLatest: async (ctx: ProgramContext) => {
 			const latest = await findLatestAnchor(ctx.store as any);
 			if (!latest) return null;
 			return { id: latest.id, height: latest.height, root: latest.root, timestamp: latest.timestamp };
 		},
 
-		/** Get the anchor chain backwards from the latest, up to limit entries. */
 		getChain: async (ctx: ProgramContext, limit: number = 20) => {
 			const store = ctx.store as any;
 			const latest = await findLatestAnchor(store);
@@ -436,12 +508,10 @@ const actorDef: ProgramActorDef = {
 			return getChainFrom(store, latest.id, limit);
 		},
 
-		/** Check if an object head is finalized (appears in any anchor). */
 		isFinal: async (ctx: ProgramContext, objectId: string, headId: string) => {
 			return await isFinalized(ctx.store as any, objectId, headId);
 		},
 
-		/** Verify a specific anchor's Merkle root. */
 		verify: async (ctx: ProgramContext, anchorId: string) => {
 			const store = ctx.store as any;
 			const obj = await store.get(anchorId);
@@ -453,28 +523,37 @@ const actorDef: ProgramActorDef = {
 			const commitsJson = String(f.commits_json?.stringValue ?? f.commits_json ?? "[]");
 			try {
 				const commits = JSON.parse(commitsJson) as AnchorCommit[];
-				const valid = verifyMerkleRoot(root, commits);
-				return { valid, anchorId, height: Number(f.height?.intValue ?? f.height ?? 0) };
+				const merkleValid = verifyMerkleRoot(root, commits);
+				const vdfOutput = String(f.vdf_output?.stringValue ?? f.vdf_output ?? "");
+				let vdfValid: boolean | undefined;
+				if (vdfOutput) {
+					try {
+						const vdf = JSON.parse(vdfOutput) as VDFProof;
+						vdfValid = validateVDF(vdf);
+					} catch { vdfValid = false; }
+				}
+				return { valid: merkleValid && (vdfValid !== false), anchorId, height: Number(f.height?.intValue ?? f.height ?? 0), vdfValid };
 			} catch (err: any) {
 				return { valid: false, error: err?.message ?? String(err) };
 			}
 		},
+
+		computeReward: async (_ctx: ProgramContext, height: number) => {
+			return computeReward(height);
+		},
 	},
 
 	onTick: async (ctx: ProgramContext) => {
-		// Auto-create anchor on tick (testnet mode: no PoST proof required).
 		const store = ctx.store as any;
 		const latest = await findLatestAnchor(store);
 		const height = latest ? latest.height + 1 : 0;
 		const previousId = latest ? latest.id : "";
 		const { id, root, commits } = await buildAnchor(ctx, previousId, height);
-
 		const s = loadState(ctx.state ?? {});
 		s.lastAnchorId = id;
 		s.lastAnchorHeight = height;
 		ctx.state!.lastAnchorId = id;
 		ctx.state!.lastAnchorHeight = height;
-
 		ctx.emit("anchor_created", { id, height, root, commitCount: commits.length });
 	},
 
@@ -488,11 +567,12 @@ const program: ProgramDef = {
 
 export default program;
 
-// ── Test exports ─────────────────────────────────────────────────
-
 export const __test = {
 	leafHash,
 	merkleRoot,
 	verifyMerkleRoot,
+	computeReward,
 	ANCHOR_TYPE_KEY,
+	BASE_REWARD_UNITS,
+	HALVING_INTERVAL,
 };

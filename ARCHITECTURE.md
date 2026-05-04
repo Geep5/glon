@@ -423,33 +423,45 @@ Changes after the latest anchor are "pending".
 CLI: `anchor create`, `anchor list [limit]`, `anchor status`, `anchor info <id>`, `anchor verify <id>`.
 Actor auto-ticks every 60s.
 
-### Simplified PoST (testnet mode)
+### PoST — Real Proof of Space and Time
 
-v1 includes simplified PoST implementations for testing the anchor integration
-before chiapos/chiavdf are available. These are **not cryptographically secure**
-and should be replaced for mainnet.
+glon uses Chia Network's production PoST libraries via subprocess CLI binaries
+installed at `~/.glon/bin/`.
 
-**`/plot`** — simplified Proof of Space:
-  - A plot is a file of N random 32-byte hashes (~32MB at 1M entries)
-  - Challenge = 32-byte hash
-  - Proof = the hash in the plot with smallest XOR distance to challenge
-  - Quality = count of leading zero bits in distance (higher = better)
-  - Winning = quality > threshold
-  - Replace with chiapos for mainnet
+**`/plot`** — Proof of Space (chiapos):
+  - Plots are created with `chiapos create -k <size> -f <file> -i <id>`
+  - k=25 = ~600MB (testing), k=32 = ~101GB (mainnet)
+  - Challenge = 32-byte hash derived from previous anchor's merkle_root
+  - Proof = lookup in the plot using Chia's secure proof-of-space construction
+  - Multiple proofs may be returned; quality is derived from proof size
+  - Binary: `~/.glon/bin/chiapos` (built from github.com/Chia-Network/chiapos)
 
-**`/timelord`** — simplified VDF:
-  - VDF = `sha256^iterations(challenge)` (sequential hashing)
-  - Proof = final hash + iteration count
-  - Verification = re-run and compare
-  - NOT secure against ASICs; replace with chiavdf for mainnet
+**`/timelord`** — Proof of Time (chiavdf):
+  - VDF = repeated squaring in class groups of unknown order
+  - Proof = Wesolowski proof (two serialized group elements)
+  - Verification = `chiavdf-verify` binary validates the Wesolowski proof
+  - Discriminant size: 1024 bits (Chia mainnet standard)
+  - Default iterations: 5,000,000 (~20-45s on modern CPUs)
+  - Binary: `~/.glon/bin/chiavdf-compute` and `~/.glon/bin/chiavdf-verify`
+    (built from github.com/Chia-Network/chiavdf)
+
+**`/anchor` PoST gate:**
+  - Anchor creation optionally accepts a VDF proof (`--vdf`)
+  - If VDF proof is provided, it is validated via `chiavdf-verify`
+  - Future: plot proofs will determine winning anchor among competing creators
+
+**Inflation rewards:**
+  - Every anchor carries a `reward_amount` and `reward_pubkey`
+  - Base reward: 5 FIG per anchor
+  - Halving: reward halves every 1,000 anchors
+  - Minimum reward: 1 unit (effectively zero after many halvings)
+  - Total supply approaches a finite cap
 
 ### What's deferred
 
-- **Real PoST cryptography** ([chiapos](https://github.com/Chia-Network/chiapos), [chiavdf](https://github.com/Chia-Network/chiavdf)): subprocess-only via bundled CLI binaries. The simplified PoST is functional for testnet but must be replaced.
-- **Reorg / fork choice**: requires the anchor chain + cumulative-VDF-iterations comparison.
+- **Reorg / fork choice**: requires anchor chain + cumulative-VDF-iterations comparison.
 - **Adversarial sync hardening**: peer scoring, ban list, bounded buffer.
 - **State rent / storage_credit accounting**: every full node stores all chain state forever in v1. The `storage_credit` field is reserved on every `chain.token` object (always `"0"` today).
-
 
 ## Sync Protocol
 

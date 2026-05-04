@@ -1,16 +1,24 @@
-// Timelord — simplified Proof of Time (VDF) for glon testnet.
+// Timelord — real Proof of Time (VDF) using chiavdf.
 //
-// This is a FUNCTIONAL BUT NOT CRYPTOGRAPHICALLY SECURE VDF implementation.
-// Real VDFs use class groups of unknown order (chiavdf). This simplified
-// version uses sequential SHA-256 hashing, which is:
-//   - Sequential (each hash depends on the previous)
-//   - Verifiable (re-run and compare)
-//   - NOT secure against ASICs or specialized hardware
+// This program shells out to chiavdf-compute and chiavdf-verify binaries
+// installed at ~/.glon/bin/. These are built from Chia Network's chiavdf
+// (https://github.com/Chia-Network/chiavdf) which uses class groups of
+// unknown order and Wesolowski proofs.
 //
-// For testnet use only. Replace with chiavdf for mainnet.
+// To install/rebuild binaries:
+//   cd /tmp && git clone https://github.com/Chia-Network/chiavdf.git
+//   cd chiavdf && mkdir build && cmake -S src -B build \
+//     -DBUILD_PYTHON=OFF -DBUILD_CHIAVDFC=OFF \
+//     -DBUILD_VDF_CLIENT=ON -DBUILD_VDF_BENCH=ON
+//   cmake --build build --target vdf_compute vdf_verify
+//   cp build/vdf_compute ~/.glon/bin/chiavdf-compute
+//   cp build/vdf_verify ~/.glon/bin/chiavdf-verify
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 import { sha256, hexEncode, hexDecode } from "../../crypto.js";
+import { spawnSync } from "node:child_process";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 // ── ANSI ─────────────────────────────────────────────────────────
 
@@ -29,48 +37,97 @@ function green(s: string) { return `${GREEN}${s}${RESET}`; }
 
 // ── Constants ────────────────────────────────────────────────────
 
-/** Default VDF iterations. Tuned for ~1-3 seconds on modern CPUs. */
+/** Default VDF iterations. Tuned for ~20-45s on modern CPUs. */
 export const DEFAULT_VDF_ITERATIONS = 5_000_000;
 
 /** Minimum iterations to prevent trivial VDFs. */
 export const MIN_ITERATIONS = 100_000;
 
-// ── VDF computation ──────────────────────────────────────────────
+/** Discriminant size in bits (Chia mainnet uses 1024). */
+export const DISCRIMINANT_SIZE_BITS = 1024;
+
+// ── Binary paths ─────────────────────────────────────────────────
+
+function binDir(): string {
+	return process.env.GLON_BIN_DIR ?? join(homedir(), ".glon", "bin");
+}
+
+function computeBin(): string {
+	return join(binDir(), "chiavdf-compute");
+}
+
+function verifyBin(): string {
+	return join(binDir(), "chiavdf-verify");
+}
+
+// ── VDF types ────────────────────────────────────────────────────
 
 export interface VDFOutput {
 	challengeHex: string;
 	iterations: number;
-	resultHex: string;
+	discriminant: string;
+	x: string; // serialized generator form
+	y: string; // serialized result form
+	proof: string; // serialized wesolowski proof
+	discriminantSizeBits: number;
 	durationMs: number;
-	ips: number; // iterations per second
 }
 
-/** Compute VDF: result = sha256^iterations(challenge). */
+// ── VDF computation ──────────────────────────────────────────────
+
+/** Compute VDF using chiavdf-compute binary. */
 export function computeVDF(challenge: Uint8Array, iterations: number): VDFOutput {
 	if (iterations < MIN_ITERATIONS) {
 		throw new Error(`VDF iterations must be >= ${MIN_ITERATIONS}`);
 	}
+	const challengeHex = hexEncode(challenge);
+	const bin = computeBin();
 	const start = Date.now();
-	let current = challenge;
-	for (let i = 0; i < iterations; i++) {
-		current = sha256(current);
-	}
+	const result = spawnSync(bin, [challengeHex, String(iterations), String(DISCRIMINANT_SIZE_BITS)], {
+		encoding: "utf-8",
+		timeout: Math.max(iterations * 2, 30000), // generous timeout
+	});
 	const durationMs = Date.now() - start;
+
+	if (result.status !== 0 || result.error) {
+		throw new Error(`chiavdf-compute failed: ${result.stderr ?? result.error?.message ?? "unknown error"}`);
+	}
+
+	const output = JSON.parse(result.stdout.trim()) as {
+		challenge_hex: string;
+		discriminant: string;
+		x: string;
+		y: string;
+		proof: string;
+		iterations: number;
+		discriminant_size_bits: number;
+		duration_ms: number;
+	};
+
 	return {
-		challengeHex: hexEncode(challenge),
-		iterations,
-		resultHex: hexEncode(current),
-		durationMs,
-		ips: Math.round((iterations / (durationMs / 1000))),
+		challengeHex: output.challenge_hex,
+		iterations: output.iterations,
+		discriminant: output.discriminant,
+		x: output.x,
+		y: output.y,
+		proof: output.proof,
+		discriminantSizeBits: output.discriminant_size_bits,
+		durationMs: durationMs,
 	};
 }
 
-/** Verify a VDF output by recomputing. */
+/** Verify a VDF output using chiavdf-verify binary. */
 export function verifyVDF(output: VDFOutput): boolean {
 	try {
-		const challenge = hexDecode(output.challengeHex);
-		const recomputed = computeVDF(challenge, output.iterations);
-		return recomputed.resultHex === output.resultHex;
+		const bin = verifyBin();
+		const result = spawnSync(bin, [
+			output.discriminant,
+			output.x,
+			output.y,
+			output.proof,
+			String(output.iterations),
+		], { encoding: "utf-8", timeout: 30000 });
+		return result.status === 0 && result.stdout.trim() === "valid";
 	} catch {
 		return false;
 	}
@@ -78,7 +135,6 @@ export function verifyVDF(output: VDFOutput): boolean {
 
 /** Derive a challenge from an anchor's merkle_root for deterministic ordering. */
 export function deriveChallenge(merkleRootHex: string): Uint8Array {
-	// Mix the merkle root with a fixed salt so the challenge is deterministic
 	const root = hexDecode(merkleRootHex);
 	const salt = new TextEncoder().encode("glon-vdf-challenge-v1");
 	const combined = new Uint8Array(root.length + salt.length);
@@ -107,12 +163,13 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				print(red(`iterations must be >= ${MIN_ITERATIONS}`));
 				break;
 			}
-			print(dim(`Computing VDF: ${iterations.toLocaleString()} iterations...`));
+			print(dim(`Computing VDF: ${iterations.toLocaleString()} iterations (${DISCRIMINANT_SIZE_BITS}-bit discriminant)...`));
 			const output = computeVDF(challenge, iterations);
 			print(green(`Done in ${output.durationMs}ms`));
-			print(dim("  result: ") + output.resultHex.slice(0, 16) + "…");
-			print(dim("  speed:  ") + `${output.ips.toLocaleString()} iter/s`);
-			print(dim("  json:   ") + JSON.stringify(output));
+			print(dim("  discriminant: ") + output.discriminant.slice(0, 30) + "…");
+			print(dim("  y:            ") + output.y.slice(0, 16) + "…");
+			print(dim("  proof:        ") + output.proof.slice(0, 16) + "…");
+			print(dim("  json:         ") + JSON.stringify(output));
 			break;
 		}
 
@@ -131,13 +188,14 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 		case "benchmark": {
 			const iterationsArg = args[0];
 			const iterations = iterationsArg ? Number(iterationsArg) : 1_000_000;
-			print(dim(`Benchmarking VDF with ${iterations.toLocaleString()} iterations...`));
+			print(dim(`Benchmarking VDF with ${iterations.toLocaleString()} iterations (${DISCRIMINANT_SIZE_BITS}-bit discriminant)...`));
 			const challenge = new Uint8Array(32);
 			crypto.getRandomValues(challenge);
 			const output = computeVDF(challenge, iterations);
 			print(green(`Completed in ${output.durationMs}ms`));
-			print(dim("  speed: ") + `${output.ips.toLocaleString()} iter/s`);
-			const timeFor5M = (5_000_000 / output.ips * 1000).toFixed(0);
+			const ips = Math.round(iterations / (output.durationMs / 1000));
+			print(dim("  speed: ") + `${ips.toLocaleString()} iter/s`);
+			const timeFor5M = (5_000_000 / ips * 1000).toFixed(0);
 			print(dim(`  estimated time for 5M iter: ${timeFor5M}ms`));
 			break;
 		}
@@ -152,12 +210,11 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 		default: {
 			print([
-				bold("  Timelord") + dim(" — simplified Proof of Time (testnet mode)"),
+				bold("  Timelord") + dim(" — Proof of Time (chiavdf / class-group VDF)"),
 				`    ${cyan("timelord compute")} ${dim("<challenge_hex> [iterations]")}  run VDF computation`,
 				`    ${cyan("timelord verify")} ${dim("<output_json>")}            verify a VDF output`,
 				`    ${cyan("timelord benchmark")} ${dim("[iterations]")}         measure VDF speed`,
 				`    ${cyan("timelord challenge")} ${dim("<merkle_root>")}        derive challenge from anchor`,
-				dim("  This is a TESTNET implementation. Replace with chiavdf for mainnet."),
 			].join("\n"));
 		}
 	}
@@ -195,4 +252,5 @@ export const __test = {
 	deriveChallenge,
 	DEFAULT_VDF_ITERATIONS,
 	MIN_ITERATIONS,
+	DISCRIMINANT_SIZE_BITS,
 };

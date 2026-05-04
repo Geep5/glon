@@ -3,18 +3,21 @@ import assert from "node:assert";
 import { __test } from "../../src/programs/handlers/timelord.js";
 import { hexEncode } from "../../src/crypto.js";
 
-const { computeVDF, verifyVDF, deriveChallenge, DEFAULT_VDF_ITERATIONS, MIN_ITERATIONS } = __test;
+const { computeVDF, verifyVDF, deriveChallenge, DEFAULT_VDF_ITERATIONS, MIN_ITERATIONS, DISCRIMINANT_SIZE_BITS } = __test;
 
-describe("timelord / compute + verify", () => {
+describe("timelord / compute + verify (chiavdf)", () => {
 	it("computes and verifies a VDF", () => {
 		const challenge = new Uint8Array(32);
 		crypto.getRandomValues(challenge);
 		const output = computeVDF(challenge, 100_000);
 		assert.strictEqual(output.challengeHex, hexEncode(challenge));
 		assert.strictEqual(output.iterations, 100_000);
-		assert.strictEqual(output.resultHex.length, 64);
+		assert.strictEqual(output.discriminantSizeBits, DISCRIMINANT_SIZE_BITS);
+		assert.ok(output.discriminant.startsWith("-0x"));
+		assert.strictEqual(output.x.length, 200); // BQFC_FORM_SIZE * 2
+		assert.strictEqual(output.y.length, 200);
+		assert.strictEqual(output.proof.length, 200);
 		assert.ok(output.durationMs >= 0);
-		assert.ok(output.ips > 0);
 
 		const valid = verifyVDF(output);
 		assert.strictEqual(valid, true);
@@ -24,16 +27,16 @@ describe("timelord / compute + verify", () => {
 		const challenge = new Uint8Array(32);
 		crypto.getRandomValues(challenge);
 		const output = computeVDF(challenge, 100_000);
-		const tampered = { ...output, resultHex: "00".repeat(32) };
+		const tampered = { ...output, y: "00".repeat(100) };
 		const valid = verifyVDF(tampered);
 		assert.strictEqual(valid, false);
 	});
 
-	it("rejects VDF with wrong iteration count", () => {
+	it("rejects VDF with wrong discriminant", () => {
 		const challenge = new Uint8Array(32);
 		crypto.getRandomValues(challenge);
 		const output = computeVDF(challenge, 100_000);
-		const tampered = { ...output, iterations: 99_999 };
+		const tampered = { ...output, discriminant: "-0x1234" };
 		const valid = verifyVDF(tampered);
 		assert.strictEqual(valid, false);
 	});
@@ -70,5 +73,9 @@ describe("timelord / constants", () => {
 
 	it("MIN_ITERATIONS is 100_000", () => {
 		assert.strictEqual(MIN_ITERATIONS, 100_000);
+	});
+
+	it("DISCRIMINANT_SIZE_BITS is 1024", () => {
+		assert.strictEqual(DISCRIMINANT_SIZE_BITS, 1024);
 	});
 });
