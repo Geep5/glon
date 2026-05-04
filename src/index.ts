@@ -33,6 +33,7 @@ import { initDisk, writeChange, readChangeByHex, listChangeFilesForObject, delet
 import { getValidator, isChainModeType } from "./programs/runtime.js";
 import { canonicalEncodeChange, canonicalEncodeChangeForSigning } from "./det/canonical.js";
 import { verify as ed25519Verify } from "./det/ed25519.js";
+import { replayBucket, decodeCoinOp, BUCKET_TYPE_KEY } from "./programs/handlers/coin.js";
 import {
 	assertPortAvailable,
 	clearEndpointLockfile,
@@ -406,6 +407,9 @@ const objectActor = actor({
 					result.state.updatedAt,
 				);
 			}
+			if (result && result.state.typeKey === BUCKET_TYPE_KEY) {
+				await store.indexCoinBucket(result.state.id);
+			}
 			c.broadcast("synced", { id: c.state.id, headIds: c.vars.headIds });
 		},
 
@@ -491,6 +495,20 @@ const storeActor = actor({
 			`);
 			await database.execute("CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_id)");
 			await database.execute("CREATE INDEX IF NOT EXISTS idx_links_relation ON links(relation_key)");
+			await database.execute(`
+				CREATE TABLE IF NOT EXISTS coins (
+					coin_id TEXT NOT NULL,
+					bucket_id TEXT NOT NULL,
+					token_id TEXT NOT NULL,
+					owner_pubkey TEXT NOT NULL,
+					amount TEXT NOT NULL,
+					spent INTEGER NOT NULL DEFAULT 0,
+					created_at INTEGER NOT NULL DEFAULT 0,
+					PRIMARY KEY (coin_id, token_id)
+				)
+			`);
+			await database.execute("CREATE INDEX IF NOT EXISTS idx_coins_token_owner ON coins(token_id, owner_pubkey, spent)");
+			await database.execute("CREATE INDEX IF NOT EXISTS idx_coins_bucket ON coins(bucket_id)");
 		},
 	}),
 
@@ -595,6 +613,7 @@ const storeActor = actor({
 			);
 			await c.db.execute("DELETE FROM changes WHERE object_id = ?", id);
 			await c.db.execute("UPDATE objects SET deleted = 1 WHERE id = ?", id);
+			await c.db.execute("DELETE FROM coins WHERE bucket_id = ?", id);
 			// Clean up disk
 			deleteChangesForObject(id);
 			c.state.objectCount = Math.max(0, c.state.objectCount - 1);
@@ -671,6 +690,11 @@ const storeActor = actor({
 			);
 		},
 
+		indexCoinBucket: async (c, bucketId: string): Promise<void> => {
+			const result = loadFromDisk(bucketId);
+			if (result) await indexCoins(c, result.state);
+		},
+
 		// ── Link queries ─────────────────────────────────────────
 
 		getLinks: async (c, objectId: string): Promise<{ targetId: string; relationKey: string; fieldKey: string }[]> => {
@@ -719,6 +743,74 @@ const storeActor = actor({
 				if (obj?.fields?.key?.stringValue === typeKey) return obj;
 			}
 			return null;
+		},
+
+		// ── Coin index queries ───────────────────────────────────
+		coinBalance: async (c, tokenId: string, pubkey: string): Promise<string> => {
+			const rows = (await c.db.execute(
+				"SELECT amount FROM coins WHERE token_id = ? AND owner_pubkey = ? AND spent = 0",
+				tokenId, pubkey,
+			)) as unknown as { amount: string }[];
+			let total = 0n;
+			for (const row of rows) total += BigInt(row.amount);
+			return total.toString();
+		},
+
+		coinHolders: async (c, tokenId: string): Promise<{ pubkey: string; balance: string }[]> => {
+			const rows = (await c.db.execute(
+				"SELECT owner_pubkey as pubkey, amount FROM coins WHERE token_id = ? AND spent = 0",
+				tokenId,
+			)) as unknown as { pubkey: string; amount: string }[];
+			const balances = new Map<string, bigint>();
+			for (const row of rows) {
+				const prev = balances.get(row.pubkey) ?? 0n;
+				balances.set(row.pubkey, prev + BigInt(row.amount));
+			}
+			const result = Array.from(balances.entries()).map(([pubkey, balance]) => ({ pubkey, balance: balance.toString() }));
+			result.sort((a, b) => {
+				const na = BigInt(a.balance);
+				const nb = BigInt(b.balance);
+				if (na < nb) return 1;
+				if (na > nb) return -1;
+				return 0;
+			});
+			return result;
+		},
+
+		coinSelect: async (c, tokenId: string, pubkey: string, minAmount?: string): Promise<{ coin_id: string; bucket_id: string; amount: string }[]> => {
+			const rows = (await c.db.execute(
+				"SELECT coin_id, bucket_id, amount FROM coins WHERE token_id = ? AND owner_pubkey = ? AND spent = 0",
+				tokenId, pubkey,
+			)) as unknown as { coin_id: string; bucket_id: string; amount: string }[];
+			rows.sort((a, b) => {
+				const na = BigInt(a.amount);
+				const nb = BigInt(b.amount);
+				if (na < nb) return 1;
+				if (na > nb) return -1;
+				return 0;
+			});
+			if (!minAmount) return rows;
+			let sum = 0n;
+			const selected: typeof rows = [];
+			for (const row of rows) {
+				selected.push(row);
+				sum += BigInt(row.amount);
+				if (sum >= BigInt(minAmount)) break;
+			}
+			return selected;
+		},
+
+		rebuildCoinIndex: async (c) => {
+			await c.db.execute("DELETE FROM coins");
+			const refs = (await c.db.execute(
+				"SELECT id FROM objects WHERE type_key = ? AND deleted = 0",
+				"chain.coin.bucket",
+			)) as unknown as { id: string }[];
+			for (const ref of refs) {
+				const result = loadFromDisk(ref.id);
+				if (result) await indexCoins(c, result.state);
+			}
+			return { rebuilt: refs.length };
 		},
 
 		graphQuery: async (c, rootId: string, depth: number, relationKey?: string): Promise<any[]> => {
@@ -801,6 +893,28 @@ async function indexObject(c: any, computed: ObjectState): Promise<void> {
 				computed.id, link.targetId, link.relationKey, link.fieldKey,
 			);
 		}
+	}
+	if (computed.typeKey === BUCKET_TYPE_KEY) {
+		await indexCoins(c, computed);
+	}
+}
+
+async function indexCoins(c: any, computed: ObjectState): Promise<void> {
+	await c.db.execute("DELETE FROM coins WHERE bucket_id = ?", computed.id);
+	const tokenField = computed.fields.get("token_id");
+	let tokenId = "";
+	if (tokenField?.linkValue?.targetId) {
+		tokenId = tokenField.linkValue.targetId;
+	} else if (typeof tokenField === "string") {
+		tokenId = tokenField;
+	}
+	const state = replayBucket(computed.blocks);
+	for (const [coinId, coin] of state.coins) {
+		await c.db.execute(
+			`INSERT INTO coins (coin_id, bucket_id, token_id, owner_pubkey, amount, spent, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			coinId, computed.id, tokenId, coin.owner, coin.amount, coin.spent ? 1 : 0, computed.createdAt,
+		);
 	}
 }
 

@@ -66,6 +66,7 @@ const SOURCES = [
 	"src/programs/handlers/anchor.ts",
 	"src/programs/handlers/plot.ts",
 	"src/programs/handlers/timelord.ts",
+	"src/programs/handlers/coin.ts",
 	"package.json",
 	"tsconfig.json",
 ];
@@ -394,6 +395,21 @@ const PROGRAMS: ProgramDef[] = [
 		},
 		entry: "token.ts",
 		modules: { "token.ts": "src/programs/handlers/token.ts" },
+	},
+	{
+		prefix: "/coin",
+		name: "Coin",
+		commands: {
+			deploy: "Deploy a new UTXO token",
+			transfer: "Send coins to a pubkey",
+			mint: "Mint new coins (owner only)",
+			burn: "Burn coins (owner only)",
+			balance: "Show one holder's balance",
+			holders: "List balances, descending",
+			info: "Show metadata + supply + owner",
+		},
+		entry: "coin.ts",
+		modules: { "coin.ts": "src/programs/handlers/coin.ts" },
 	},
 	{
 		prefix: "/consensus",

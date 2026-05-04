@@ -74,6 +74,7 @@ export const MINT_FEE_MULTIPLIER = 10n;
  */
 const TYPE_DISPATCH: Record<string, { prefix: string; action: string; idKey: string }> = {
 	"chain.token": { prefix: "/token", action: "validate_op", idKey: "tokenId" },
+	"chain.coin.bucket": { prefix: "/coin", action: "validate_op", idKey: "bucketId" },
 };
 
 // ── Op-kind classification (informational, fee-only) ─────────────
@@ -429,7 +430,7 @@ const program: ProgramDef = {
 		// maintains. See the 'Async semantic dispatch' note above.
 		return MIRROR_STATE;
 	}),
-	validatedTypes: ["chain.token"],
+	validatedTypes: ["chain.token", "chain.coin.bucket"],
 };
 export default program;
 

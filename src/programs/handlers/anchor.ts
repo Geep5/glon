@@ -42,7 +42,7 @@ export const ANCHOR_TYPE_KEY = "chain.anchor";
 const AUTO_ANCHOR_MS = 60_000;
 
 /** Chain-mode types that anchors commit to. */
-const TRACKED_TYPES = ["chain.token"];
+const TRACKED_TYPES = ["chain.token", "chain.coin.bucket"];
 
 /** Inflation: base reward in smallest units (1 FIG = 1_000_000 units). */
 const BASE_REWARD_UNITS = 5_000_000; // 5 FIG
