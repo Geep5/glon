@@ -6,10 +6,10 @@ glon is a single stack with three layers designed together:
 
 1. **A distributed object kernel.** Every entity is a content-addressed object in a DAG. Changes are immutable, signed, and replayable. Objects are actors: they wake, compute state from their history, and sleep. No external database.
 
+
 2. **An agent harness (Holdfast).** Identity-aware conversation ingest, durable memory (pinned facts + milestone arcs), scheduled reminders, persistent shell sessions, and subagent batching. An agent's entire conversation lives as blocks in its object's DAG. Compaction keeps context windows bounded without losing history.
 
-3. **Native crypto.** Every agent owns an Ed25519 keypair in a local wallet. Agents deploy UTXO tokens, sign transactions, and hold balances. The same signature gate that protects chain-mode objects also authenticates agent actions.
-
+3. **Native crypto.** Every agent owns an Ed25519 keypair in a local wallet. Agents deploy UTXO tokens, create atomic swap offers, sign transactions, and hold balances. The same signature gate that protects chain-mode objects also authenticates agent actions.
 What makes this an ideal environment for agents:
 
 - **Nothing is ever lost.** Deleted objects and compacted conversation blocks remain in the DAG. Agents can `recall` any past block or `inject` any object — even tombstoned ones — back into their active context.
@@ -53,6 +53,7 @@ Every script auto-loads `.env`. The dev server binds `:6420` (set `GLON_PORT` to
 **Models:** Set the agent's `model` field to switch providers.
 - Anthropic (default): `claude-sonnet-4-20250514`
 - Kimi (Moonshot): `moonshot-v1-8k`, `moonshot-v1-32k`, etc.
+
 - Kimi Coding (`sk-kimi-*` keys): `kimi-for-coding`
 
 **Headless:** `npx tsx scripts/daemon.ts` loads programs and exposes `POST /dispatch` on `:6430`.
@@ -64,7 +65,7 @@ Every script auto-loads `.env`. The dev server binds `:6420` (set `GLON_PORT` to
 Zero built-in commands. Every feature below is a program loaded from the store at startup.
 
 | Program | Layer | Purpose |
-|---|---|---|
+| --- | --- | --- |
 | `/help` | — | List available programs |
 | `/crud` | Kernel | Create, list, get, set, delete, search objects |
 | `/inspect` | Kernel | DAG history, change details, sync state |
@@ -77,7 +78,7 @@ Zero built-in commands. Every feature below is a program loaded from the store a
 | `/discord` | Harness | Discord bridge |
 | `/holdfast` | Harness | Agent harness: identity-aware ingest + memory + reminders + shell + subagents |
 | `/wallet` | Crypto | Local-only Ed25519 keychain |
-| `/coin` | Crypto | UTXO-based fungible tokens |
+| `/coin` | Crypto | UTXO tokens + atomic offers (chain.coin.offer) |
 | `/consensus` | Crypto | Validator gate for chain-mode: nonce + fee + semantic checks |
 | `/anchor` | Crypto | State commitment + PoST gate + inflation rewards |
 | `/plot` | Crypto | Proof of Space (chiapos) |
@@ -176,6 +177,26 @@ glon> /coin transfer 90c86a5a... b2c3d4e5... 250 --key=alice
 
 glon> /coin balance 90c86a5a... a1b2c3d4...
   FIG  750
+
+```
+
+### `/coin offer` — atomic swaps
+
+Peer-to-peer N-for-M token trades with cross-object batch atomicity. Offers never expire.
+
+- `chain.coin.offer` objects hold terms (`offered` vs `requested`), escrowed coins, and payment coins.
+- `offer_escrow` — maker deposits offered coins.
+- `offer_pay` — taker deposits requested coins.
+- `offer_settle` — atomic batch writes spend+pay+settle across bucket(s) and offer object.
+- `offer_cancel` — maker refunds escrow.
+- `offer_claim` — each party spends their output coins from the settled offer into their own bucket.
+
+```
+glon> /coin offer create <token_id> <amount> <request_token_id> <request_amount> --key=alice
+glon> /coin offer accept <offer_id> --key=bob
+glon> /coin offer claim <offer_id> --key=alice
+glon> /coin offer list
+glon> /coin offer info <offer_id>
 ```
 
 ### `/anchor` — state commitment
