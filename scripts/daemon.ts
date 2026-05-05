@@ -110,11 +110,29 @@ async function main() {
 				res.writeHead(500, { "Content-Type": "application/json" });
 				res.end(JSON.stringify({ ok: false, error: err?.message ?? String(err) }));
 			}
+
 		});
 	});
+
 	server.listen(httpPort, "127.0.0.1", () => {
 		console.log(`[daemon] dispatch http listening on 127.0.0.1:${httpPort}`);
 	});
+
+	// Trading round tick: every 5 minutes during market hours
+	try {
+		const { startRound, checkRoundTimeout } = await import("./trading-rounds.js");
+		setInterval(async () => {
+			try {
+				await checkRoundTimeout();
+				await startRound();
+			} catch (e: any) {
+				console.error("[daemon] trading round error:", e.message);
+			}
+		}, 5 * 60 * 1000);
+		console.log("[daemon] trading round tick every 5 min");
+	} catch {
+		console.log("[daemon] trading rounds not available");
+	}
 
 	// Heartbeat every 60s so log shows the daemon is alive.
 	setInterval(() => {
