@@ -25,6 +25,7 @@ import * as proto from "../proto.js";
 import type { ObjectState } from "../dag/dag.js";
 
 import { style } from "./shared.js";
+	import * as sharedMod from "./shared.js";
 import * as cryptoMod from "../crypto.js";
 import * as detCanonical from "../det/canonical.js";
 
@@ -405,6 +406,8 @@ async function compileModuleProgram(ms: ModuleSet, name: string): Promise<Progra
 			"det/math.js": detMath,
 			"det/ed25519.js": detEd25519,
 			"det/index.js": det,
+			"shared.js": sharedMod,
+			"runtime.js": { registerIndexHook, getIndexHook, registerAuthVerifier, getAuthVerifier, getValidator, isChainModeType },
 		};
 		const factory = new Function(bundled);
 		// Node built-ins go through the real require, scoped to node: prefix only
@@ -594,22 +597,35 @@ export function listProgramActors(): Array<{ programId: string; prefix: string; 
 	}));
 }
 
-/** Start a program actor instance. */
-export async function startProgramActor(
-	entry: ProgramEntry,
-	makeCtx: (state: Record<string, any>) => ProgramContext,
-): Promise<ProgramActorInstance | null> {
-	const actorDef = entry.def?.actor;
-	if (!actorDef) return null;
+	/** Start a program actor instance. */
+	export async function startProgramActor(
+		entry: ProgramEntry,
+		makeCtx: (state: Record<string, any>) => ProgramContext,
+		client?: any,
+	): Promise<ProgramActorInstance | null> {
+		const actorDef = entry.def?.actor;
+		if (!actorDef) return null;
 
-	const state = actorDef.createState?.() ?? {};
-	const instance: ProgramActorInstance = {
-		programId: entry.id,
-		prefix: entry.prefix,
-		def: actorDef,
-		state,
-		tickHandle: null,
-	};
+		const state = actorDef.createState?.() ?? {};
+		const instance: ProgramActorInstance = {
+			programId: entry.id,
+			prefix: entry.prefix,
+			def: actorDef,
+			state,
+			tickHandle: null,
+		};
+
+		// Ensure the RivetKit program actor exists with the correct programId.
+		// This lets external HTTP callers dispatch through the actor gateway.
+		if (client?.programActor) {
+			try {
+				await client.programActor.getOrCreate([entry.id], {
+					createWithInput: { programId: entry.id } as any,
+				});
+			} catch {
+				// Non-fatal: the local instance still works for CLI use.
+			}
+		}
 
 	// Run onCreate
 	if (actorDef.onCreate) {

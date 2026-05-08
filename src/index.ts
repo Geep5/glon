@@ -16,6 +16,7 @@
 
 import "./env.js"; // side-effect: load .env into process.env before anything reads it
 import { actor, event, setup } from "rivetkit";
+	import { createClient } from "rivetkit/client";
 import { db } from "rivetkit/db";
 import type { Change, Operation, Value, ObjectRef, Block, ObjectLink } from "./proto.js";
 import { encodeChange, encodeChangeForHashing, decodeChange, stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue } from "./proto.js";
@@ -1143,9 +1144,14 @@ const programActor = actor({
 
 	actions: {
 		/** Generic action dispatch: route to the program's named action. */
+		/** Generic action dispatch: route to the program's named action. */
 		dispatch: async (c, action: string, argsJson: string): Promise<string> => {
 			const { dispatchActorAction } = await import("./programs/runtime.js");
 			const args: any[] = JSON.parse(argsJson);
+			// Self-healing: if the actor was created without programId (e.g. stale
+			// actor from an older bootstrap), fall back to the actor key which is
+			// the program object id.
+			const programId = c.state.programId || (Array.isArray(c.key) ? c.key[0] : c.key);
 			const makeCtx = (state: Record<string, any>) => ({
 				client: c.client<typeof app>(),
 				store: c.client<typeof app>().storeActor.getOrCreate(["root"]),
@@ -1165,12 +1171,12 @@ const programActor = actor({
 				state,
 				emit: (channel: string, data: any) => {
 					c.broadcast("programEvent", {
-						programId: c.state.programId,
+						programId,
 						channel,
 						data: JSON.stringify(data),
 					});
 				},
-				programId: c.state.programId,
+				programId,
 				objectActor: (id: string) => c.client<typeof app>().objectActor.getOrCreate([id]),
 				dispatchProgram: async (prefix: string, actionName: string, actionArgs: unknown[]) => {
 					const { getProgramActorByPrefix, dispatchActorAction: dispatch2 } = await import("./programs/runtime.js");
@@ -1185,7 +1191,7 @@ const programActor = actor({
 					return await dispatch2(inst.programId, actionName, [input], makeCtx);
 				},
 			});
-			const result = await dispatchActorAction(c.state.programId, action, args, makeCtx);
+			const result = await dispatchActorAction(programId, action, args, makeCtx);
 			return JSON.stringify(result ?? null);
 		},
 
@@ -1213,23 +1219,79 @@ export const app = setup({
 	maxIncomingMessageSize: 10_000_000,
 });
 
-async function startServer(): Promise<void> {
-	try {
-		await assertPortAvailable(MANAGER_PORT);
-	} catch (err) {
-		console.error((err as Error).message);
-		process.exit(1);
+	async function startServer(): Promise<void> {
+		try {
+			await assertPortAvailable(MANAGER_PORT);
+		} catch (err) {
+			console.error((err as Error).message);
+			process.exit(1);
+		}
+		writeEndpointLockfile(MANAGER_PORT);
+		const cleanup = () => {
+			clearEndpointLockfile();
+			process.exit(0);
+		};
+		process.on("SIGINT", cleanup);
+		process.on("SIGTERM", cleanup);
+		process.on("exit", clearEndpointLockfile);
+		app.start();
+
+		// Load programs into the server process so RivetKit program actors can dispatch.
+		// The CLI (client.ts) also loads them, but the server needs its own copy of the
+		// actorInstances map since program actors run in this process.
+		setTimeout(async () => {
+			try {
+				const endpoint = `http://127.0.0.1:${MANAGER_PORT}`;
+				const client = createClient<typeof app>(endpoint);
+				const store = client.storeActor.getOrCreate(["root"]);
+				const { loadPrograms, startProgramActor } = await import("./programs/runtime.js");
+				const programs = await loadPrograms(store, client);
+				if (programs.length > 0) {
+					console.log(`[server] Loaded ${programs.length} programs.`);
+					for (const prog of programs) {
+						try {
+							const makeCtx = (state: Record<string, any>) => ({
+								client,
+								store,
+								resolveId: async (prefix: string) => {
+									const resolved = await store.resolvePrefix(prefix);
+									return resolved || null;
+								},
+								stringVal, intVal, floatVal, boolVal, mapVal, listVal, linkVal, displayValue,
+								listChangeFiles: () => [],
+								readChangeByHex: () => null,
+								hexEncode,
+								print: (msg: string) => console.log(msg),
+								style,
+								randomUUID: () => generateObjectId(),
+								state,
+								emit: () => {},
+								programId: prog.id,
+								objectActor: (id: string, opts?: any) => client.objectActor.getOrCreate([id], opts),
+								dispatchProgram: async (prefix: string, actionName: string, actionArgs: unknown[]) => {
+									const { getProgramActorByPrefix, dispatchActorAction: dispatch2 } = await import("./programs/runtime.js");
+									const inst = getProgramActorByPrefix(prefix);
+									if (!inst) throw new Error(`Program not running: ${prefix}`);
+									return await dispatch2(inst.programId, actionName, actionArgs, (s) => ({ ...makeCtx(s), programId: inst.programId }));
+								},
+								dispatchTypedAction: async (prefix: string, actionName: string, input: unknown) => {
+									const { getProgramActorByPrefix, dispatchActorAction: dispatch2 } = await import("./programs/runtime.js");
+									const inst = getProgramActorByPrefix(prefix);
+									if (!inst) throw new Error(`Program not running: ${prefix}`);
+									return await dispatch2(inst.programId, actionName, [input], (s) => ({ ...makeCtx(s), programId: inst.programId }));
+								},
+							});
+							await startProgramActor(prog, makeCtx, client);
+						} catch (err: any) {
+							console.warn(`[server] Failed to start ${prog.prefix}: ${err.message}`);
+						}
+					}
+				}
+			} catch (err: any) {
+				console.warn("[server] Program load failed:", err.message);
+			}
+		}, 2000);
 	}
-	writeEndpointLockfile(MANAGER_PORT);
-	const cleanup = () => {
-		clearEndpointLockfile();
-		process.exit(0);
-	};
-	process.on("SIGINT", cleanup);
-	process.on("SIGTERM", cleanup);
-	process.on("exit", clearEndpointLockfile);
-	app.start();
-}
 
 // Run immediately when invoked as the entry point (not when imported for types).
 // Using a top-level await-less IIFE keeps this file valid under CJS-style bundles.
