@@ -13,7 +13,7 @@
  *     tool, the parent gets status:"no_submit_result" + final assistant
  *     text as output.
  *
- * Mocks Anthropic via globalThis.__ANTHROPIC_FETCH and stubs the program
+ * Mocks Anthropic via globalThis.__LLM_FETCH and stubs the program
  * dispatcher so the child's submit_result tool routes to the real
  * doSubmitResult helper exported from the program.
  *
@@ -123,7 +123,7 @@ function createHarness() {
 // tool_use(submit_result, {result: ...}); second call → final text "done".
 function mockSubmitResultThenDone(payload: unknown = { ok: true, hello: "world" }) {
 	let toolCounter = 0;
-	(globalThis as any).__ANTHROPIC_FETCH = async ({ messages }: { messages: any[] }) => {
+	(globalThis as any).__LLM_FETCH = async ({ messages }: { messages: any[] }) => {
 		const sawSubmit = messages.some((m) =>
 			Array.isArray(m.content) && m.content.some((c: any) => c.type === "tool_use" && c.name === "submit_result"),
 		);
@@ -139,13 +139,13 @@ function mockSubmitResultThenDone(payload: unknown = { ok: true, hello: "world" 
 }
 
 function mockNoSubmitResult() {
-	(globalThis as any).__ANTHROPIC_FETCH = async () => ({
+	(globalThis as any).__LLM_FETCH = async () => ({
 		content: [{ type: "text", text: "I forgot to submit." }],
 		stopReason: "end_turn", model: "mock", inputTokens: 4, outputTokens: 4,
 	});
 }
 
-function restoreAnthropic() { delete (globalThis as any).__ANTHROPIC_FETCH; }
+function restoreAnthropic() { delete (globalThis as any).__LLM_FETCH; }
 
 // Wires the child's submit_result dispatch back to the real handler so the
 // fully-real tool path is exercised end-to-end.

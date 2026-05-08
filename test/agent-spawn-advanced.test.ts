@@ -94,7 +94,7 @@ function createHarness() {
 }
 
 function mockSubmitResultThenDone(payload: unknown = { ok: true }) {
-	(globalThis as any).__ANTHROPIC_FETCH = async ({ messages }: { messages: any[] }) => {
+	(globalThis as any).__LLM_FETCH = async ({ messages }: { messages: any[] }) => {
 		const sawSubmit = messages.some((m) =>
 			Array.isArray(m.content) && m.content.some((c: any) => c.type === "tool_use" && c.name === "submit_result"),
 		);
@@ -109,12 +109,12 @@ function mockSubmitResultThenDone(payload: unknown = { ok: true }) {
 }
 
 function mockHangForever() {
-	(globalThis as any).__ANTHROPIC_FETCH = async () => new Promise(() => {}); // never resolves
+	(globalThis as any).__LLM_FETCH = async () => new Promise(() => {}); // never resolves
 }
 
 function mockPayloadsInOrder(payloads: unknown[]) {
 	let i = 0;
-	(globalThis as any).__ANTHROPIC_FETCH = async ({ messages }: { messages: any[] }) => {
+	(globalThis as any).__LLM_FETCH = async ({ messages }: { messages: any[] }) => {
 		const sawSubmit = messages.some((m) =>
 			Array.isArray(m.content) && m.content.some((c: any) => c.type === "tool_use" && c.name === "submit_result"),
 		);
@@ -130,7 +130,7 @@ function mockPayloadsInOrder(payloads: unknown[]) {
 }
 
 function restore() {
-	delete (globalThis as any).__ANTHROPIC_FETCH;
+	delete (globalThis as any).__LLM_FETCH;
 	__test._resetRunSlots();
 }
 

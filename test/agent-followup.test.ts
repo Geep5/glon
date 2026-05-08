@@ -18,7 +18,7 @@
  *   5. Hook throws: error is swallowed, ask returns the pre-throw aggregate.
  *   6. mergeAskResults: counter sums, flag ORs, finalText fallback.
  *
- * Mocks Anthropic via globalThis.__ANTHROPIC_FETCH; in-memory store/actor
+ * Mocks Anthropic via globalThis.__LLM_FETCH; in-memory store/actor
  * matches the pattern in test/agent-tooluse.test.ts.
  *
  * Run: npx tsx --test test/agent-followup.test.ts
@@ -146,7 +146,7 @@ function createTestHarness() {
 
 function mockAnthropic(responses: Array<{ content: any[]; stopReason?: string }>) {
 	let i = 0;
-	(globalThis as any).__ANTHROPIC_FETCH = async () => {
+	(globalThis as any).__LLM_FETCH = async () => {
 		if (i >= responses.length) throw new Error(`Mock Anthropic exhausted (called ${i + 1}x)`);
 		const r = responses[i++];
 		return {
@@ -161,7 +161,7 @@ function mockAnthropic(responses: Array<{ content: any[]; stopReason?: string }>
 }
 
 function restoreAnthropic() {
-	delete (globalThis as any).__ANTHROPIC_FETCH;
+	delete (globalThis as any).__LLM_FETCH;
 	_resetRunSlots();
 }
 

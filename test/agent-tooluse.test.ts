@@ -10,7 +10,7 @@
  *   - Iteration cap: throws when the model never stops calling tools
  *   - extractTurns: rebuilds Anthropic-shaped messages from mixed blocks
  *
- * Mocks Anthropic via `globalThis.__ANTHROPIC_FETCH`; stubs the store/actor
+ * Mocks Anthropic via `globalThis.__LLM_FETCH`; stubs the store/actor
  * with a minimal in-memory harness.
  *
  * Run: npx tsx --test test/agent-tooluse.test.ts
@@ -148,7 +148,7 @@ function createTestHarness() {
 
 function mockAnthropic(responses: Array<{ content: any[]; stopReason?: string }>) {
 	let i = 0;
-	(globalThis as any).__ANTHROPIC_FETCH = async () => {
+	(globalThis as any).__LLM_FETCH = async () => {
 		if (i >= responses.length) throw new Error(`Mock Anthropic exhausted (called ${i + 1}x)`);
 		const r = responses[i++];
 		return {
@@ -162,7 +162,7 @@ function mockAnthropic(responses: Array<{ content: any[]; stopReason?: string }>
 }
 
 function restoreAnthropic() {
-	delete (globalThis as any).__ANTHROPIC_FETCH;
+	delete (globalThis as any).__LLM_FETCH;
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -387,7 +387,7 @@ describe("agent tool-use loop", () => {
 		h.onDispatch("/loop", "go", () => "keep going");
 
 		// Always return a tool_use — should trip the iteration cap.
-		(globalThis as any).__ANTHROPIC_FETCH = async () => ({
+		(globalThis as any).__LLM_FETCH = async () => ({
 			content: [{ type: "tool_use", id: "tu_x", name: "loop", input: {} }],
 			stopReason: "tool_use",
 			model: "test-model",
@@ -448,7 +448,7 @@ describe("agent tool-use loop", () => {
 
 		// Second ask: capture the messages the mock sees.
 		let seenMessages: any[] = [];
-		(globalThis as any).__ANTHROPIC_FETCH = async (req: { messages: any[] }) => {
+		(globalThis as any).__LLM_FETCH = async (req: { messages: any[] }) => {
 			seenMessages = req.messages;
 			return {
 				content: [{ type: "text", text: "Done two." }],

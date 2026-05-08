@@ -60,7 +60,7 @@ function mockAnthropicSequenced() {
 		if (!startedSignals[i]) startedSignals[i] = deferred();
 	}
 
-	(globalThis as any).__ANTHROPIC_FETCH = async () => {
+	(globalThis as any).__LLM_FETCH = async () => {
 		const i = nextIndex++;
 		ensureSlot(i);
 		startedSignals[i].resolve();
@@ -93,7 +93,7 @@ function mockAnthropicSequenced() {
 }
 
 function restoreAnthropic() {
-	delete (globalThis as any).__ANTHROPIC_FETCH;
+	delete (globalThis as any).__LLM_FETCH;
 }
 
 // ── In-memory agent harness ──────────────────────────────────────

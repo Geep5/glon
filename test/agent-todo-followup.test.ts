@@ -164,7 +164,7 @@ function createTestHarness() {
 
 function mockAnthropic(responses: Array<{ content: any[]; stopReason?: string }>) {
 	let i = 0;
-	(globalThis as any).__ANTHROPIC_FETCH = async () => {
+	(globalThis as any).__LLM_FETCH = async () => {
 		if (i >= responses.length) throw new Error(`Mock Anthropic exhausted (called ${i + 1}x)`);
 		const r = responses[i++];
 		return {
@@ -179,7 +179,7 @@ function mockAnthropic(responses: Array<{ content: any[]; stopReason?: string }>
 }
 
 function restoreAnthropic() {
-	delete (globalThis as any).__ANTHROPIC_FETCH;
+	delete (globalThis as any).__LLM_FETCH;
 	_resetRunSlots();
 }
 

@@ -20,7 +20,7 @@ import type { ProgramContext } from "../src/programs/runtime.js";
 // ── Helpers ──────────────────────────────────────────────────────
 
 function restoreAnthropic() {
-	delete (globalThis as any).__ANTHROPIC_FETCH;
+	delete (globalThis as any).__LLM_FETCH;
 }
 
 interface StoredBlock {
@@ -499,7 +499,7 @@ describe("doCompact", () => {
 		]);
 
 		// Mock the summarisation LLM call.
-		(globalThis as any).__ANTHROPIC_FETCH = async (req: { messages: any[] }) => {
+		(globalThis as any).__LLM_FETCH = async (req: { messages: any[] }) => {
 			// Expect the user message to be the structured summary prompt.
 			const body = req.messages[0].content as string;
 			assert.match(body, /summarising an agent's conversation/);
@@ -571,7 +571,7 @@ describe("doCompact", () => {
 		]);
 
 		let lastPrompt = "";
-		(globalThis as any).__ANTHROPIC_FETCH = async (req: { messages: any[] }) => {
+		(globalThis as any).__LLM_FETCH = async (req: { messages: any[] }) => {
 			lastPrompt = req.messages[0].content as string;
 			return {
 				content: [{ type: "text", text: "## Goal\nNew summary." }],
@@ -604,7 +604,7 @@ describe("doCompact", () => {
 		]);
 
 		let lastPrompt = "";
-		(globalThis as any).__ANTHROPIC_FETCH = async (req: { messages: any[] }) => {
+		(globalThis as any).__LLM_FETCH = async (req: { messages: any[] }) => {
 			lastPrompt = req.messages[0].content as string;
 			return {
 				content: [{ type: "text", text: "## Goal\nSummary." }],
@@ -640,7 +640,7 @@ describe("runAsk auto-compaction", () => {
 
 		let summaryCalled = false;
 		let askCalled = false;
-		(globalThis as any).__ANTHROPIC_FETCH = async (req: { messages: any[] }) => {
+		(globalThis as any).__LLM_FETCH = async (req: { messages: any[] }) => {
 			const first = req.messages[0].content;
 			if (typeof first === "string" && first.includes("summarising an agent's conversation")) {
 				summaryCalled = true;
@@ -674,7 +674,7 @@ describe("runAsk auto-compaction", () => {
 		h.seedBlocks(agentId, [{ content: userText("hi") }]);
 
 		let summaryCalled = false;
-		(globalThis as any).__ANTHROPIC_FETCH = async (req: { messages: any[] }) => {
+		(globalThis as any).__LLM_FETCH = async (req: { messages: any[] }) => {
 			const first = req.messages[0].content;
 			if (typeof first === "string" && first.includes("summarising")) {
 				summaryCalled = true;
@@ -708,7 +708,7 @@ describe("runAsk auto-compaction", () => {
 
 		let askAttempts = 0;
 		let summaryCalled = false;
-		(globalThis as any).__ANTHROPIC_FETCH = async (req: { messages: any[] }) => {
+		(globalThis as any).__LLM_FETCH = async (req: { messages: any[] }) => {
 			const first = req.messages[0].content;
 			if (typeof first === "string" && first.includes("summarising")) {
 				summaryCalled = true;
