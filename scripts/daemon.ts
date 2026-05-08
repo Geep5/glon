@@ -208,6 +208,27 @@ async function resolveId(raw: string): Promise<string | null> {
 			return;
 		}
 
+
+		// ── GET /programs ────────────────────────────────────────────
+		if (req.method === "GET" && url.pathname === "/programs") {
+			const payload = programs.map((p) => ({
+				id: p.id,
+				prefix: p.prefix,
+				name: p.name,
+				typedActions: p.def?.actor?.typedActions
+					? Object.fromEntries(
+						Object.entries(p.def.actor.typedActions).map(([k, v]) => [
+							k,
+							{ description: v.description, inputSchema: v.inputSchema },
+						]),
+					)
+					: undefined,
+				tickMs: p.def?.actor?.tickMs ?? undefined,
+			}));
+			res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+			res.end(JSON.stringify({ ok: true, programs: payload }));
+			return;
+		}
 		// ── POST /tasks/:id/toggle ─────────────────────────────────
 		if (req.method === "POST" && url.pathname.startsWith("/tasks/")) {
 			const match = url.pathname.match(/^\/tasks\/(.+?)\/toggle$/);
