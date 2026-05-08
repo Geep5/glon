@@ -1132,18 +1132,24 @@ interface ProgramActorState {
 	programState: string; // JSON-serialized program state
 }
 
-const programActor = actor({
-	createState: (_c, input?: { programId: string }): ProgramActorState => ({
-		programId: input?.programId ?? "",
-		programState: "{}",
-	}),
+	const programActor = actor({
+		createState: (_c, input?: { programId: string }): ProgramActorState => ({
+			programId: input?.programId ?? "",
+			programState: "{}",
+		}),
 
-	events: {
-		programEvent: event<{ programId: string; channel: string; data: string }>(),
-	},
+		options: {
+			// Agent asks can involve many tool iterations + LLM round-trips.
+			// Default 60s is too short for complex tasks (e.g. holdfast setup).
+			actionTimeout: 300_000, // 5 minutes
+		},
+
+		events: {
+			programEvent: event<{ programId: string; channel: string; data: string }>(),
+		},
+
 
 	actions: {
-		/** Generic action dispatch: route to the program's named action. */
 		/** Generic action dispatch: route to the program's named action. */
 		dispatch: async (c, action: string, argsJson: string): Promise<string> => {
 			const { dispatchActorAction } = await import("./programs/runtime.js");
