@@ -1664,6 +1664,46 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 					return replayOffer(blocks);
 				},
 			},
+
+			coinStats: {
+				description: "Global coin stats per token from SQLite index",
+				inputSchema: { type: "object" },
+				handler: async (ctx: ProgramContext): Promise<Record<string, { totalSupply: string; holders: number; buckets: number }>> => {
+					const store = ctx.store as any;
+					return await store.coinStats();
+				},
+			},
+
+			coinHolders: {
+				description: "List holders and balances for a token from SQLite index",
+				inputSchema: {
+					type: "object",
+					required: ["tokenId"],
+					properties: {
+						tokenId: { type: "string" },
+					},
+				},
+				handler: async (ctx: ProgramContext, input: { tokenId: string }): Promise<{ pubkey: string; balance: string }[]> => {
+					const store = ctx.store as any;
+					return await store.coinHolders(input.tokenId);
+				},
+			},
+
+			coinBalance: {
+				description: "Single pubkey balance for a token from SQLite index",
+				inputSchema: {
+					type: "object",
+					required: ["tokenId", "pubkey"],
+					properties: {
+						tokenId: { type: "string" },
+						pubkey: { type: "string" },
+					},
+				},
+				handler: async (ctx: ProgramContext, input: { tokenId: string; pubkey: string }): Promise<string> => {
+					const store = ctx.store as any;
+					return await store.coinBalance(input.tokenId, input.pubkey);
+				},
+			},
 		},
 	};
 

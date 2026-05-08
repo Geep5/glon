@@ -843,6 +843,31 @@ const storeActor = actor({
 			return result;
 		},
 
+		coinStats: async (c): Promise<Record<string, { totalSupply: string; holders: number; buckets: number }>> => {
+			const rows = (await c.db.execute(
+				"SELECT token_id, amount, owner_pubkey, bucket_id FROM coins WHERE spent = 0",
+			)) as unknown as { token_id: string; amount: string; owner_pubkey: string; bucket_id: string }[];
+			const byToken = new Map<string, { totalSupply: bigint; holders: Set<string>; buckets: Set<string> }>();
+			for (const row of rows) {
+				let entry = byToken.get(row.token_id);
+				if (!entry) {
+					entry = { totalSupply: 0n, holders: new Set(), buckets: new Set() };
+					byToken.set(row.token_id, entry);
+				}
+				entry.totalSupply += BigInt(row.amount);
+				entry.holders.add(row.owner_pubkey);
+				entry.buckets.add(row.bucket_id);
+			}
+			const result: Record<string, { totalSupply: string; holders: number; buckets: number }> = {};
+			for (const [tokenId, entry] of byToken) {
+				result[tokenId] = {
+					totalSupply: entry.totalSupply.toString(),
+					holders: entry.holders.size,
+					buckets: entry.buckets.size,
+				};
+			}
+			return result;
+		},
 		coinSelect: async (c, tokenId: string, pubkey: string, minAmount?: string): Promise<{ coin_id: string; bucket_id: string; amount: string }[]> => {
 			const rows = (await c.db.execute(
 				"SELECT coin_id, bucket_id, amount FROM coins WHERE token_id = ? AND owner_pubkey = ? AND spent = 0",
