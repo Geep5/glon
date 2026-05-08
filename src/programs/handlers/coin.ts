@@ -5,21 +5,16 @@
 //   - chain.coin.bucket: holds up to 1000 coins as BlockAdd ops with contentType="chain.coin.op"
 //   - SQLite coins table: index for O(1) balance queries
 //
-// Each coin is a block:
-//   create: { coin_id, owner_pubkey, amount }
-//   spend:  { coin_id }
+// This file is the entry point. Core logic lives in:
+//   coin-types.ts  — types and constants
+//   coin-bucket.ts — UTXO replay, validation, change builders
+//   coin-offer.ts  — atomic-swap replay, validation
 //
-// Bucket state is derived by replaying block trees in DAG order.
-// The SQL index is rebuilt from buckets on every object index.
+// Importing coin-bucket.ts triggers its side-effect registration of
+// the SQL index hook at module load.
 
-
-
-import type { ProgramDef, ProgramContext, ProgramActorDef, ValidatorFn, ValidationResult, IndexHookFn } from "../runtime.js";
-
-import { registerIndexHook } from "../runtime.js";
-
-import type { ObjectState } from "../../dag/dag.js";
-import type { Change, Block } from "../../proto.js";
+import type { ProgramDef, ProgramContext, ProgramActorDef, ValidationResult, Block } from "../runtime.js";
+import type { Change } from "../../proto.js";
 import { encodeChange, decodeChange } from "../../proto.js";
 import {
 	parseUint,
@@ -30,189 +25,46 @@ import {
 	bigToString,
 } from "../../det/math.js";
 import { hexEncode, hexDecode } from "../../crypto.js";
+import { randomBytes } from "node:crypto";
+import { dim, bold, cyan, red, green, yellow } from "../shared.js";
+import { X402Authorization, canonicalAuthBytes, verifyX402Auth } from "./coin-x402.js";
 
+// Side-effect: registers the bucket index hook with the kernel.
+import "./coin-bucket.js";
 
+import {
+	TOKEN_TYPE_KEY,
+	BUCKET_TYPE_KEY,
+	OFFER_TYPE_KEY,
+	OP_CONTENT_TYPE,
+	MAX_COINS_PER_BUCKET,
+	extractStr,
+	extractInt,
+	extractBool,
+	type CoinOp,
+	type OfferTerms,
+	type BucketState,
+	type OfferState,
+	type TokenMeta,
+} from "./coin-types.js";
 
-	import { randomBytes } from "node:crypto";
-	import { dim, bold, cyan, red, green, yellow } from "../shared.js";
-	import { X402Authorization, canonicalAuthBytes, verifyX402Auth } from "./coin-x402.js";
+	import {
+		replayBucket,
+		buildBucketGenesisChange,
+		buildCoinOpChange,
+		validateBucketChange,
+		classifyBucketChange,
+		decodeCoinOp,
+		encodeCoinOp,
+		validator as bucketValidator,
+	} from "./coin-bucket.js";
 
-// ── Constants ────────────────────────────────────────────────────
-
-export const TOKEN_TYPE_KEY = "chain.token";
-export const BUCKET_TYPE_KEY = "chain.coin.bucket";
-
-export const OFFER_TYPE_KEY = "chain.coin.offer";
-export const OP_CONTENT_TYPE = "chain.coin.op";
-export const MAX_COINS_PER_BUCKET = 1000;
-
-// ── Types ────────────────────────────────────────────────────────
-
-export interface TokenMeta {
-	name: string;
-	symbol: string;
-	decimals: number;
-	ownerPubkey: string;
-	totalSupply: bigint;
-	mintRenounced: boolean;
-}
-
-
-export interface CoinOp {
-	kind: "create" | "spend" | "offer_escrow" | "offer_pay" | "offer_settle" | "offer_cancel";
-	coinId: string;
-	ownerPubkey?: string;
-	amount?: string;
-	tokenId?: string;
-	outputs?: string; // JSON array for offer_settle
-}
-
-export interface OfferTerms {
-	offered: Array<{ tokenId: string; amount: string }>;
-	requested: Array<{ tokenId: string; amount: string }>;
-}
-
-export interface BucketState {
-	tokenId: string;
-	coins: Map<string, { owner: string; amount: string; spent: boolean }>;
-}
-
-export interface OfferState {
-	status: "open" | "funded" | "settled" | "cancelled";
-	escrowed: Map<string, { owner: string; amount: string; tokenId: string; spent: boolean }>;
-	payments: Map<string, { owner: string; amount: string; tokenId: string; spent: boolean }>;
-	outputs: Map<string, { owner: string; amount: string; tokenId: string }>;
-}
-// ── Op decoding ──────────────────────────────────────────────────
-
-
-export function decodeCoinOp(block: Block): CoinOp | null {
-	const custom = block.content?.custom;
-	if (!custom || custom.contentType !== OP_CONTENT_TYPE) return null;
-	const meta = custom.meta as Record<string, string> | undefined;
-	if (!meta) return null;
-	const kind = meta.op;
-	const validKinds = ["create", "spend", "offer_escrow", "offer_pay", "offer_settle", "offer_cancel"];
-	if (!kind || !validKinds.includes(kind)) return null;
-	const op: CoinOp = { kind: kind as CoinOp["kind"], coinId: meta.coin_id ?? "" };
-	if (kind === "create" || kind === "offer_escrow" || kind === "offer_pay") {
-		op.ownerPubkey = meta.owner_pubkey;
-		op.amount = meta.amount;
-		op.tokenId = meta.token_id;
-	}
-	if (kind === "offer_settle") {
-		op.outputs = meta.outputs;
-	}
-	return op;
-}
-
-
-export function encodeCoinOp(op: CoinOp): Record<string, string> {
-	const out: Record<string, string> = { op: op.kind, coin_id: op.coinId };
-	if (op.ownerPubkey !== undefined) out.owner_pubkey = op.ownerPubkey;
-	if (op.amount !== undefined) out.amount = op.amount;
-	if (op.tokenId !== undefined) out.token_id = op.tokenId;
-	if (op.outputs !== undefined) out.outputs = op.outputs;
-	return out;
-}
-
-// ── Bucket replay ────────────────────────────────────────────────
-
-export function replayBucket(blocks: Block[]): BucketState {
-	const coins = new Map<string, { owner: string; amount: string; spent: boolean }>();
-	for (const block of blocks) {
-		const op = decodeCoinOp(block);
-		if (!op) continue;
-		if (op.kind === "create") {
-			coins.set(op.coinId, {
-				owner: op.ownerPubkey ?? "",
-				amount: op.amount ?? "0",
-				spent: false,
-			});
-		} else if (op.kind === "spend") {
-			const existing = coins.get(op.coinId);
-			if (existing) existing.spent = true;
-		}
-	}
-
-	return { tokenId: "", coins };
-}
-
-// ── Offer replay ─────────────────────────────────────────────────
-
-
-export function replayOffer(blocks: Block[]): OfferState {
-	const escrowed = new Map<string, { owner: string; amount: string; tokenId: string; spent: boolean }>();
-	const payments = new Map<string, { owner: string; amount: string; tokenId: string; spent: boolean }>();
-	const outputs = new Map<string, { owner: string; amount: string; tokenId: string }>();
-	let status: OfferState["status"] = "open";
-
-	// First pass: collect escrow and payment coins regardless of block order.
-	// computeState topologically sorts changes, so settle may appear before escrow.
-	for (const block of blocks) {
-		const op = decodeCoinOp(block);
-		if (!op) continue;
-		if (op.kind === "offer_escrow") {
-			escrowed.set(op.coinId, {
-				owner: op.ownerPubkey ?? "",
-				amount: op.amount ?? "0",
-				tokenId: op.tokenId ?? "",
-				spent: false,
-			});
-		} else if (op.kind === "offer_pay") {
-			payments.set(op.coinId, {
-				owner: op.ownerPubkey ?? "",
-				amount: op.amount ?? "0",
-				tokenId: op.tokenId ?? "",
-				spent: false,
-			});
-		}
-	}
-
-	// Second pass: process state transitions (settle, cancel, outputs, claims).
-	for (const block of blocks) {
-		const op = decodeCoinOp(block);
-		if (!op) continue;
-		if (op.kind === "offer_settle") {
-			for (const c of escrowed.values()) c.spent = true;
-			for (const c of payments.values()) c.spent = true;
-			if (op.outputs) {
-				try {
-					const parsed = JSON.parse(op.outputs) as Array<{ coin_id: string; owner_pubkey: string; amount: string; token_id: string }>;
-					for (const o of parsed) {
-						outputs.set(o.coin_id, {
-							owner: o.owner_pubkey,
-							amount: o.amount,
-							tokenId: o.token_id,
-						});
-					}
-				} catch {
-					// ignore malformed outputs
-				}
-			}
-			status = "settled";
-		} else if (op.kind === "offer_cancel") {
-			for (const c of escrowed.values()) c.spent = true;
-			status = "cancelled";
-		} else if (op.kind === "create") {
-			outputs.set(op.coinId, {
-				owner: op.ownerPubkey ?? "",
-				amount: op.amount ?? "0",
-				tokenId: op.tokenId ?? "",
-			});
-		} else if (op.kind === "spend") {
-			outputs.delete(op.coinId);
-		}
-	}
-
-	// Determine status: if escrowed and payments exist, it's funded
-	if (status === "open" && payments.size > 0) {
-		status = "funded";
-	}
-
-	return { status, escrowed, payments, outputs };
-}
-// ── Token metadata helpers ───────────────────────────────────────
+import {
+	replayOffer,
+	buildOfferGenesisChange,
+	validateOfferChange,
+	classifyOfferChange,
+} from "./coin-offer.js";
 
 function extractStr(v: any): string {
 	if (v === null || v === undefined) return "";
@@ -256,312 +108,6 @@ export async function loadTokenMeta(
 		mintRenounced: extractBool(f.mint_renounced),
 	};
 }
-
-// ── Change builders ──────────────────────────────────────────────
-
-export function buildBucketGenesisChange(args: {
-	bucketId: string;
-	timestamp: number;
-	author: string;
-	tokenId: string;
-	capacity?: number;
-}): Change {
-	return {
-		id: new Uint8Array(0),
-		objectId: args.bucketId,
-		parentIds: [],
-		ops: [
-			{ objectCreate: { typeKey: BUCKET_TYPE_KEY } },
-			{ fieldSet: { key: "token_id", value: { linkValue: { targetId: args.tokenId, relationKey: "token" } } } },
-			{ fieldSet: { key: "capacity", value: { intValue: args.capacity ?? MAX_COINS_PER_BUCKET } } },
-		],
-		timestamp: args.timestamp,
-		author: args.author,
-	};
-}
-
-export function buildOfferGenesisChange(args: {
-	offerId: string;
-	timestamp: number;
-	author: string;
-	makerPubkey: string;
-	terms: string;
-}): Change {
-	return {
-		id: new Uint8Array(0),
-		objectId: args.offerId,
-		parentIds: [],
-		ops: [
-			{ objectCreate: { typeKey: OFFER_TYPE_KEY } },
-			{ fieldSet: { key: "maker_pubkey", value: { stringValue: args.makerPubkey } } },
-			{ fieldSet: { key: "terms", value: { stringValue: args.terms } } },
-			{ fieldSet: { key: "status", value: { stringValue: "open" } } },
-		],
-		timestamp: args.timestamp,
-		author: args.author,
-	};
-}
-
-export function buildCoinOpChange(args: {
-	bucketId: string;
-	parentIds: Uint8Array[];
-	timestamp: number;
-	author: string;
-	op: CoinOp;
-	blockId: string;
-}): Change {
-	const meta = encodeCoinOp(args.op);
-	return {
-		id: new Uint8Array(0),
-		objectId: args.bucketId,
-		parentIds: args.parentIds,
-		ops: [{
-			blockAdd: {
-				parentId: "",
-				afterId: "",
-				block: {
-					id: args.blockId,
-					childrenIds: [],
-					content: {
-						custom: {
-							contentType: OP_CONTENT_TYPE,
-							data: new Uint8Array(0),
-							meta,
-						},
-					},
-				},
-			},
-		}],
-		timestamp: args.timestamp,
-		author: args.author,
-	};
-}
-
-// ── Validator ────────────────────────────────────────────────────
-
-function classifyBucketChange(change: Change): { kind: "Genesis" } | { kind: "Op"; op: CoinOp } | { kind: "Unknown"; reason: string } {
-	const ops = change.ops ?? [];
-	const hasCreate = ops.some((o) => !!o.objectCreate);
-	const blockAdds = ops.filter((o) => !!o.blockAdd);
-
-	if (hasCreate) {
-		if (blockAdds.length > 0) return { kind: "Unknown", reason: "Genesis must not contain blocks" };
-		return { kind: "Genesis" };
-	}
-
-	if (blockAdds.length !== 1) {
-		return { kind: "Unknown", reason: "Bucket op must contain exactly one BlockAdd" };
-	}
-	const block = blockAdds[0].blockAdd!.block;
-	const op = decodeCoinOp(block);
-	if (!op) return { kind: "Unknown", reason: "Invalid chain.coin.op block" };
-	return { kind: "Op", op };
-}
-
-export function validateBucketChange(
-	change: Change,
-	priorBlocks: Block[],
-): ValidationResult {
-	// This validator focuses on semantic rules.
-	const classification = classifyBucketChange(change);
-
-	if (classification.kind === "Unknown") {
-		return { valid: false, error: `coin: ${classification.reason}` };
-	}
-	if (classification.kind === "Genesis") {
-		if (priorBlocks.length > 0) return { valid: false, error: "coin: bucket genesis must be first change" };
-		return { valid: true };
-	}
-
-	// Op semantic validation: replay prior state and check invariants
-	const state = replayBucket(priorBlocks);
-	const op = classification.op;
-
-	if (op.kind === "create") {
-		if (!op.ownerPubkey || !op.amount) {
-			return { valid: false, error: "coin: create missing owner_pubkey or amount" };
-		}
-		try {
-			parseUint(op.amount);
-		} catch (e: any) {
-			return { valid: false, error: `coin: create bad amount: ${e.message}` };
-		}
-		if (state.coins.size >= MAX_COINS_PER_BUCKET) {
-			return { valid: false, error: "coin: bucket at capacity" };
-		}
-		if (state.coins.has(op.coinId)) {
-			return { valid: false, error: "coin: duplicate coin_id in bucket" };
-		}
-		return { valid: true };
-	}
-
-	if (op.kind === "spend") {
-		const coin = state.coins.get(op.coinId);
-		if (!coin) return { valid: false, error: "coin: spend of unknown coin" };
-		if (coin.spent) return { valid: false, error: "coin: double spend" };
-		return { valid: true };
-	}
-
-	return { valid: false, error: "coin: unreachable" };
-}
-
-export const validator: ValidatorFn = (changes: Change[]): ValidationResult => {
-	for (const change of changes) {
-		const c = classifyBucketChange(change);
-		if (c.kind === "Unknown") return { valid: false, error: `coin: ${c.reason}` };
-		if (c.kind === "Genesis") {
-			// Genesis shape check only; semantic check needs prior state
-			const ops = change.ops ?? [];
-			const hasTokenLink = ops.some((o) =>
-				o.fieldSet?.key === "token_id" && o.fieldSet.value?.linkValue?.targetId
-			);
-			if (!hasTokenLink) return { valid: false, error: "coin: bucket genesis missing token_id link" };
-		}
-		// Op semantic validation defers to actor's validate_op (same v1 compromise as token)
-	}
-
-	return { valid: true };
-};
-
-// ── Offer validator ──────────────────────────────────────────────
-
-function classifyOfferChange(change: Change): { kind: "Genesis" } | { kind: "Op"; ops: CoinOp[] } | { kind: "Unknown"; reason: string } {
-	const ops = change.ops ?? [];
-	const hasCreate = ops.some((o) => !!o.objectCreate);
-	const blockAdds = ops.filter((o) => !!o.blockAdd);
-
-	if (hasCreate) {
-		if (blockAdds.length > 0) return { kind: "Unknown", reason: "Genesis must not contain blocks" };
-		return { kind: "Genesis" };
-	}
-
-	const coinOps: CoinOp[] = [];
-	for (const ba of blockAdds) {
-		const op = decodeCoinOp(ba.blockAdd!.block);
-		if (!op) return { kind: "Unknown", reason: "Invalid chain.coin.op block in offer" };
-		coinOps.push(op);
-	}
-	return { kind: "Op", ops: coinOps };
-}
-
-export function validateOfferChange(
-	change: Change,
-	priorBlocks: Block[],
-	_batchContext?: import("../runtime.js").BatchValidationContext,
-): ValidationResult {
-	const classification = classifyOfferChange(change);
-
-	if (classification.kind === "Unknown") {
-		return { valid: false, error: `offer: ${classification.reason}` };
-	}
-	if (classification.kind === "Genesis") {
-		if (priorBlocks.length > 0) return { valid: false, error: "offer: genesis must be first change" };
-		const ops = change.ops ?? [];
-		const hasMaker = ops.some((o) => o.fieldSet?.key === "maker_pubkey");
-		const hasTerms = ops.some((o) => o.fieldSet?.key === "terms");
-		if (!hasMaker) return { valid: false, error: "offer: genesis missing maker_pubkey" };
-		if (!hasTerms) return { valid: false, error: "offer: genesis missing terms" };
-		return { valid: true };
-	}
-
-	const state = replayOffer(priorBlocks);
-	const ops = classification.ops;
-
-	// Only one offer state-changing op per change
-	const stateOps = ops.filter((o) => o.kind === "offer_escrow" || o.kind === "offer_pay" || o.kind === "offer_settle" || o.kind === "offer_cancel");
-	if (stateOps.length > 1) {
-		return { valid: false, error: "offer: only one state op per change" };
-	}
-
-	for (const op of ops) {
-		if (op.kind === "offer_escrow") {
-			if (state.status !== "open") return { valid: false, error: "offer: escrow only when open" };
-			if (!op.ownerPubkey || !op.amount) {
-				return { valid: false, error: "offer: escrow missing owner_pubkey or amount" };
-			}
-			try {
-				parseUint(op.amount);
-			} catch (e: any) {
-				return { valid: false, error: `offer: escrow bad amount: ${e.message}` };
-			}
-			if (state.escrowed.has(op.coinId)) {
-				return { valid: false, error: "offer: duplicate escrow coin_id" };
-			}
-		}
-
-		if (op.kind === "offer_pay") {
-			if (state.status !== "open" && state.status !== "funded") {
-				return { valid: false, error: "offer: pay only when open or funded" };
-			}
-			if (!op.ownerPubkey || !op.amount) {
-				return { valid: false, error: "offer: pay missing owner_pubkey or amount" };
-			}
-			try {
-				parseUint(op.amount);
-			} catch (e: any) {
-				return { valid: false, error: `offer: pay bad amount: ${e.message}` };
-			}
-			if (state.payments.has(op.coinId)) {
-				return { valid: false, error: "offer: duplicate payment coin_id" };
-			}
-		}
-
-
-		if (op.kind === "offer_settle") {
-			// v1: allow settle when open because payments may be in the same batch.
-			// In v2 we can cross-check batchContext for payment blocks.
-			if (state.status !== "open" && state.status !== "funded") {
-				return { valid: false, error: "offer: settle only when open or funded" };
-			}
-			if (!op.outputs) {
-				return { valid: false, error: "offer: settle missing outputs" };
-			}
-			let parsedOutputs: Array<{ coin_id: string; owner_pubkey: string; amount: string; token_id: string }>;
-			try {
-				parsedOutputs = JSON.parse(op.outputs);
-			} catch {
-				return { valid: false, error: "offer: settle outputs invalid JSON" };
-			}
-			if (!Array.isArray(parsedOutputs) || parsedOutputs.length === 0) {
-				return { valid: false, error: "offer: settle outputs must be non-empty array" };
-			}
-			for (const out of parsedOutputs) {
-				try {
-					parseUint(out.amount);
-				} catch (e: any) {
-					return { valid: false, error: `offer: settle output bad amount: ${e.message}` };
-				}
-			}
-		}
-
-		if (op.kind === "offer_cancel") {
-			if (state.status !== "open" && state.status !== "funded") {
-				return { valid: false, error: "offer: cancel only when open or funded" };
-			}
-		}
-
-		if (op.kind === "create") {
-			// Output coins after settlement — standard create validation
-			if (!op.ownerPubkey || !op.amount) {
-				return { valid: false, error: "offer: create output missing owner_pubkey or amount" };
-			}
-			try {
-				parseUint(op.amount);
-			} catch (e: any) {
-				return { valid: false, error: `offer: create output bad amount: ${e.message}` };
-			}
-		}
-
-		if (op.kind === "spend") {
-			// Spending an output coin (claim)
-			const out = state.outputs.get(op.coinId);
-			if (!out) return { valid: false, error: "offer: spend of unknown output coin" };
-		}
-	}
-
-	return { valid: true };
-}
-// ── Handler (CLI) ────────────────────────────────────────────────
 
 async function buildX402SettleBatch(
 	auth: X402Authorization,
@@ -1920,8 +1466,6 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 	}
 };
 
-// ── Actor (programmatic API) ─────────────────────────────────────
-
 	const actorDef: ProgramActorDef = {
 		createState: () => ({}),
 		actions: {
@@ -2123,7 +1667,6 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 		},
 	};
 
-
 const program: ProgramDef = {
 	handler,
 	actor: actorDef,
@@ -2163,33 +1706,23 @@ const program: ProgramDef = {
 	chainMode: true,
 };
 
+
+	// Re-exports for backward compatibility (tests and external callers).
+	export {
+		decodeCoinOp,
+		encodeCoinOp,
+		replayBucket,
+		replayOffer,
+		validateBucketChange,
+		validateOfferChange,
+		classifyBucketChange,
+		classifyOfferChange,
+		buildBucketGenesisChange,
+		buildOfferGenesisChange,
+		buildCoinOpChange,
+		MAX_COINS_PER_BUCKET,
+	};
 export default program;
-
-
-// ── Index hook ───────────────────────────────────────────────────
-
-/** Rebuild the SQLite coins index for a single bucket object. */
-async function indexCoins(c: any, computed: ObjectState): Promise<void> {
-	await c.db.execute("DELETE FROM coins WHERE bucket_id = ?", computed.id);
-	const tokenField = computed.fields.get("token_id");
-	let tokenId = "";
-	if (tokenField?.linkValue?.targetId) {
-		tokenId = tokenField.linkValue.targetId;
-	} else if (typeof tokenField === "string") {
-		tokenId = tokenField;
-	}
-	const state = replayBucket(computed.blocks);
-	for (const [coinId, coin] of state.coins) {
-		await c.db.execute(
-			`INSERT INTO coins (coin_id, bucket_id, token_id, owner_pubkey, amount, spent, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			coinId, computed.id, tokenId, coin.owner, coin.amount, coin.spent ? 1 : 0, computed.createdAt,
-		);
-	}
-}
-
-// Register at module load so the kernel dispatches without hardcoding.
-registerIndexHook([BUCKET_TYPE_KEY], indexCoins);
 
 // ── Internal exports for testing ─────────────────────────────────
 
