@@ -223,27 +223,18 @@ export function extractString(v: any): string | undefined {
 	return undefined;
 }
 
-export function extractInt(v: any, fallback: number): number {
-	if (v === null || v === undefined) return fallback;
-	if (typeof v === "number") return v;
-	if (v.intValue !== undefined) {
-		const n = Number(v.intValue);
+	export function extractInt(v: any, fallback: number): number {
+		const s = extractString(v);
+		if (s === undefined) return fallback;
+		const n = parseInt(s, 10);
 		return Number.isFinite(n) ? n : fallback;
 	}
-	if (v.floatValue !== undefined) {
-		const n = Number(v.floatValue);
-		return Number.isFinite(n) ? Math.floor(n) : fallback;
+
+	export function extractBool(v: any, fallback: boolean): boolean {
+		const s = extractString(v);
+		if (s === undefined) return fallback;
+		return s === "true" || s === "1";
 	}
-	return fallback;
-}
-
-export function extractBool(v: any, fallback: boolean): boolean {
-	if (v === null || v === undefined) return fallback;
-	if (typeof v === "boolean") return v;
-	if (v.boolValue !== undefined) return !!v.boolValue;
-	return fallback;
-}
-
 export function extractMapEntries(v: any): Record<string, any> | undefined {
 	if (v === null || v === undefined) return undefined;
 	if (typeof v === "object" && !Array.isArray(v)) return v;
