@@ -15,7 +15,7 @@
 
 import type { ProgramDef, ProgramContext, ProgramActorDef, ValidationResult, Block } from "../runtime.js";
 import type { Change } from "../../proto.js";
-	import { encodeChange, decodeChange, encodeChangeBundle } from "../../proto.js";
+	import { encodeChange, decodeChange } from "../../proto.js";
 import {
 	parseUint,
 	addBounded,
@@ -91,183 +91,6 @@ function extractBool(v: any): boolean {
 	return false;
 }
 
-/** Populate anchor fields on a CoinOp before building the change.
- *  Looks up the bucket's current state, computes state_root and prev_anchor_id.
- */
-async function populateAnchorFields(
-	baseOp: CoinOp,
-	bucketId: string,
-	store: any,
-): Promise<CoinOp> {
-	const obj = await store.get(bucketId);
-	const blocks: Block[] = obj?.blocks ?? [];
-	const provenance: Record<string, { changeId: string; timestamp: number }> = obj?.blockProvenance ?? {};
-	const state = replayBucket(blocks);
-	const root = computeStateRoot(state);
-	const prevId = findPrevAnchorId(blocks, new Map(Object.entries(provenance).map(([k, v]) => [k, { changeId: hexDecode(v.changeId), timestamp: v.timestamp }])));
-	return {
-		...baseOp,
-		state_root: hexEncode(root),
-		prev_anchor_id: prevId,
-	};
-}
-
-	/** Build and send a ChangeBundle of coin transfer changes to a peer. */
-	async function doCoinSend(
-		ctx: ProgramContext,
-		input: {
-			recipient_peer_id: string;
-			token_id: string;
-			amount: string;
-			transport?: string;
-		},
-	): Promise<{ delivery_id: string; bundle_size: number }> {
-		const { dispatchProgram, store, resolveId, objectActor, randomUUID } = ctx;
-		const storeAny = store as any;
-
-		// 1. Resolve recipient peer
-		const peerRecord = await dispatchProgram("/peer", "get", [input.recipient_peer_id]) as any;
-		if (!peerRecord) throw new Error(`Peer ${input.recipient_peer_id} not found`);
-		const recipientPubkey = peerRecord.identity_pubkey;
-		if (!recipientPubkey) throw new Error(`Peer ${input.recipient_peer_id} has no identity_pubkey`);
-		if (!/^[0-9a-f]{64}$/.test(recipientPubkey)) throw new Error("recipient identity_pubkey must be 64 hex chars");
-
-		// 2. Get sender pubkey
-		const keyName = "default";
-		const keyInfo: any = await dispatchProgram("/wallet", "show", [keyName]);
-		if (!keyInfo) throw new Error(`Wallet key "${keyName}" not found`);
-		const senderPubkey = keyInfo.pubkey as string;
-
-		// 3. Resolve token id
-		const tokenId = (await resolveId(input.token_id)) ?? input.token_id;
-
-		// 4. Select coins
-		const selected = await storeAny.coinSelect(tokenId, senderPubkey, input.amount) as { coin_id: string; bucket_id: string; amount: string }[];
-		let sum = 0n;
-		for (const c of selected) sum += BigInt(c.amount);
-		if (sum < BigInt(input.amount)) throw new Error(`Insufficient balance: have ${sum.toString()}, need ${input.amount}`);
-
-		// 5. Build all changes
-		const bundleChanges: Uint8Array[] = [];
-
-		// Spend inputs
-		for (const coin of selected) {
-			const bucketActor = objectActor(coin.bucket_id);
-			const heads = await bucketActor.getHeads() as string[];
-			const spendChange = buildCoinOpChange({
-				bucketId: coin.bucket_id,
-				parentIds: heads.map(hexDecode),
-				timestamp: Date.now(),
-				author: "coin-send",
-				op: { kind: "spend", coinId: coin.coin_id },
-				blockId: randomUUID().replace(/-/g, "").slice(0, 16),
-			});
-			const spendB64 = Buffer.from(encodeChange(spendChange)).toString("base64");
-			const nonce: number = await dispatchProgram("/consensus", "getNonce", [senderPubkey]) as number;
-			const { changeB64: signedB64 } = await dispatchProgram("/wallet", "signChange", [{
-				name: keyName,
-				changeB64: spendB64,
-				nonce: nonce + 1,
-				fee: 1,
-			}]) as { changeB64: string };
-			await bucketActor.pushChanges(signedB64);
-			bundleChanges.push(new Uint8Array(Buffer.from(signedB64, "base64")));
-		}
-
-		// Create outputs
-		const changeAmount = subChecked(sum, parseUint(input.amount));
-		const outputs: { coinId: string; owner: string; amount: string }[] = [
-			{ coinId: randomUUID().replace(/-/g, "").slice(0, 16), owner: recipientPubkey, amount: input.amount },
-		];
-		if (changeAmount > BIG_ZERO) {
-			outputs.push({
-				coinId: randomUUID().replace(/-/g, "").slice(0, 16),
-				owner: senderPubkey,
-				amount: bigToString(changeAmount),
-			});
-		}
-
-		// Find or create output bucket
-		let outputBucketId: string | null = null;
-		const allBuckets = await storeAny.list(BUCKET_TYPE_KEY) as { id: string }[];
-		for (const ref of allBuckets) {
-			const bucket = await storeAny.get(ref.id) as any;
-			if (bucket?.fields?.token_id?.linkValue?.targetId !== tokenId) continue;
-			const bState = replayBucket(bucket.blocks ?? []);
-			let unspentCount = 0;
-			for (const c of bState.coins.values()) if (!c.spent) unspentCount++;
-			if (unspentCount + outputs.length <= MAX_COINS_PER_BUCKET) {
-				outputBucketId = ref.id;
-				break;
-			}
-		}
-
-		if (!outputBucketId) {
-			outputBucketId = randomUUID().replace(/-/g, "").slice(0, 24);
-			const genesisChange = buildBucketGenesisChange({
-				bucketId: outputBucketId,
-				timestamp: Date.now(),
-				author: "coin-send",
-				tokenId,
-			});
-			const genesisB64 = Buffer.from(encodeChange(genesisChange)).toString("base64");
-			const nonce: number = await dispatchProgram("/consensus", "getNonce", [senderPubkey]) as number;
-			const { changeB64: signedGenesisB64 } = await dispatchProgram("/wallet", "signChange", [{
-				name: keyName,
-				changeB64: genesisB64,
-				nonce: nonce + 1,
-				fee: 1,
-			}]) as { changeB64: string };
-			const genesisActor = objectActor(outputBucketId, { createWithInput: { id: outputBucketId } });
-			await genesisActor.pushChanges(signedGenesisB64);
-			bundleChanges.push(new Uint8Array(Buffer.from(signedGenesisB64, "base64")));
-		}
-
-		const outBucketActor = objectActor(outputBucketId);
-		for (const out of outputs) {
-			const heads = await outBucketActor.getHeads() as string[];
-			const createChange = buildCoinOpChange({
-				bucketId: outputBucketId,
-				parentIds: heads.map(hexDecode),
-				timestamp: Date.now(),
-				author: "coin-send",
-				op: { kind: "create", coinId: out.coinId, ownerPubkey: out.owner, amount: out.amount },
-				blockId: randomUUID().replace(/-/g, "").slice(0, 16),
-			});
-			const createB64 = Buffer.from(encodeChange(createChange)).toString("base64");
-			const nonce: number = await dispatchProgram("/consensus", "getNonce", [senderPubkey]) as number;
-			const { changeB64: signedCreateB64 } = await dispatchProgram("/wallet", "signChange", [{
-				name: keyName,
-				changeB64: createB64,
-				nonce: nonce + 1,
-				fee: 1,
-			}]) as { changeB64: string };
-			await outBucketActor.pushChanges(signedCreateB64);
-			bundleChanges.push(new Uint8Array(Buffer.from(signedCreateB64, "base64")));
-		}
-
-		// 6. Build ChangeBundle
-		const bundle = { changes: bundleChanges };
-		const bundleBytes = encodeChangeBundle(bundle);
-		const bundleB64 = Buffer.from(bundleBytes).toString("base64");
-
-		// 7. Determine transport and endpoint
-		const transportPrefix = input.transport ?? peerRecord.preferred_transport ?? "/transport-file";
-		const endpoint = peerRecord.endpoints ?? "file:///Users/grantfarwell/projekt/4/glonFiggies/transport-inbox";
-
-		// 8. Send via transport
-		const sendResult = await dispatchProgram(transportPrefix, "send", [{
-			endpoint,
-			payload_b64: bundleB64,
-			content_type: "glon/change-bundle",
-			metadata: { token_id: tokenId, sender: senderPubkey, recipient: recipientPubkey },
-		}]) as any;
-
-		return {
-			delivery_id: sendResult.delivery_id,
-			bundle_size: bundleChanges.length,
-		};
-	}
 
 export async function loadTokenMeta(
 	tokenId: string,
@@ -1870,27 +1693,124 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				},
 			},
 
-				send: {
-					description: "Send coins to a peer via transport. Builds a ChangeBundle with anchor.",
-					inputSchema: {
-						type: "object",
-						required: ["recipient_peer_id", "token_id", "amount"],
-						properties: {
-							recipient_peer_id: { type: "string" },
-							token_id: { type: "string" },
-							amount: { type: "string" },
-							transport: { type: "string" },
-						},
-					},
-					handler: async (ctx: ProgramContext, input: {
-						recipient_peer_id: string;
-						token_id: string;
-						amount: string;
-						transport?: string;
-					}): Promise<{ delivery_id: string; bundle_size: number }> => {
-						return await doCoinSend(ctx, input);
+			gift: {
+				description: "Create a gift offer — escrow coins with zero requested. Recipient calls offer accept + claim.",
+				inputSchema: {
+					type: "object",
+					required: ["token_id", "amount", "recipient_pubkey"],
+					properties: {
+						token_id: { type: "string" },
+						amount: { type: "string" },
+						recipient_pubkey: { type: "string" },
+						key_name: { type: "string" },
 					},
 				},
+				handler: async (ctx: ProgramContext, input: {
+					token_id: string;
+					amount: string;
+					recipient_pubkey: string;
+					key_name?: string;
+				}): Promise<{ offer_id: string }> => {
+					const { dispatchProgram, store, resolveId, objectActor, randomUUID } = ctx;
+					const storeAny = store as any;
+					const keyName = input.key_name ?? "default";
+
+					const keyInfo: any = await dispatchProgram("/wallet", "show", [keyName]);
+					if (!keyInfo) throw new Error(`Wallet key "${keyName}" not found`);
+					const makerPubkey = keyInfo.pubkey as string;
+
+					const tokenId = (await resolveId(input.token_id)) ?? input.token_id;
+					const amount = input.amount;
+
+					// Select coins
+					const selected = await storeAny.coinSelect(tokenId, makerPubkey, amount) as { coin_id: string; bucket_id: string; amount: string }[];
+					let sum = 0n;
+					for (const c of selected) sum += BigInt(c.amount);
+					if (sum < BigInt(amount)) throw new Error(`Insufficient balance: have ${sum.toString()}, need ${amount}`);
+
+					const offerId = randomUUID().replace(/-/g, "").slice(0, 24);
+					const batchEntries: Array<{ objectId: string; changesBase64: string }> = [];
+
+					// 1. Spend maker's coins
+					for (const coin of selected) {
+						const bucketActor = objectActor(coin.bucket_id);
+						const heads = await bucketActor.getHeads() as string[];
+						const spendChange = buildCoinOpChange({
+							bucketId: coin.bucket_id,
+							parentIds: heads.map(hexDecode),
+							timestamp: Date.now(),
+							author: "gift-create",
+							op: { kind: "spend", coinId: coin.coin_id },
+							blockId: randomUUID().replace(/-/g, "").slice(0, 16),
+						});
+						const spendB64 = Buffer.from(encodeChange(spendChange)).toString("base64");
+						const nonce: number = await dispatchProgram("/consensus", "getNonce", [makerPubkey]) as number;
+						const { changeB64: signedB64 } = await dispatchProgram("/wallet", "signChange", [{
+							name: keyName,
+							changeB64: spendB64,
+							nonce: nonce + 1,
+							fee: 1,
+						}]) as { changeB64: string };
+						batchEntries.push({ objectId: coin.bucket_id, changesBase64: signedB64 });
+					}
+
+					// 2. Offer genesis with empty requested
+					const terms: OfferTerms = {
+						offered: [{ tokenId, amount }],
+						requested: [],
+					};
+					const genesisResult = await dispatchProgram("/coin", "buildOfferGenesis", [{
+						offerId,
+						timestamp: Date.now(),
+						author: "gift-create",
+						makerPubkey,
+						terms,
+					}]) as { changeB64: string };
+					const genesisNonce: number = await dispatchProgram("/consensus", "getNonce", [makerPubkey]) as number;
+					const { changeB64: signedGenesisB64 } = await dispatchProgram("/wallet", "signChange", [{
+						name: keyName,
+						changeB64: genesisResult.changeB64,
+						nonce: genesisNonce + 1,
+						fee: 10,
+					}]) as { changeB64: string };
+					batchEntries.push({ objectId: offerId, changesBase64: signedGenesisB64 });
+
+					// 3. Escrow into offer
+					for (const coin of selected) {
+						const escrowChange = buildCoinOpChange({
+							bucketId: offerId,
+							parentIds: [],
+							timestamp: Date.now(),
+							author: "gift-create",
+							op: {
+								kind: "offer_escrow",
+								coinId: coin.coin_id,
+								ownerPubkey: makerPubkey,
+								amount: coin.amount,
+								tokenId,
+							},
+							blockId: randomUUID().replace(/-/g, "").slice(0, 16),
+						});
+						const escrowB64 = Buffer.from(encodeChange(escrowChange)).toString("base64");
+						const nonce: number = await dispatchProgram("/consensus", "getNonce", [makerPubkey]) as number;
+						const { changeB64: signedEscrowB64 } = await dispatchProgram("/wallet", "signChange", [{
+							name: keyName,
+							changeB64: escrowB64,
+							nonce: nonce + 1,
+							fee: 10,
+						}]) as { changeB64: string };
+						batchEntries.push({ objectId: offerId, changesBase64: signedEscrowB64 });
+					}
+
+					// 4. Push changes individually
+					for (const entry of batchEntries) {
+						const actor = objectActor(entry.objectId, { createWithInput: { id: entry.objectId } });
+						await actor.pushChanges(entry.changesBase64);
+					}
+
+					return { offer_id: offerId };
+				},
+			},
 			coinBalance: {
 				description: "Single pubkey balance for a token from SQLite index",
 				inputSchema: {
