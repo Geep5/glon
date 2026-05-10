@@ -801,7 +801,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 					}
 
 					// 2. Offer genesis
-					const genesisChange = await (actorDef.actions!.buildOfferGenesis as any)({}, {
+					const genesisChange = await (actorDef.typedActions!.buildOfferGenesis.handler as any)({}, {
 						offerId,
 						timestamp: Date.now(),
 						author: "offer-create",
@@ -820,11 +820,16 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 					}]) as { changeB64: string };
 					batchEntries.push({ objectId: offerId, changesBase64: signedGenesisB64 });
 
+					// Decode genesis id for escrow parent
+					const signedGenesisBytes = Buffer.from(signedGenesisB64, "base64");
+					const signedGenesisChange = decodeChange(signedGenesisBytes);
+					const genesisId = hexEncode(signedGenesisChange.id);
+
 					// 3. Escrow coins in offer
 					for (const coin of selected) {
 						const escrowChange = buildCoinOpChange({
 							bucketId: offerId,
-							parentIds: [], // genesis is parent
+							parentIds: [hexDecode(genesisId)],
 							timestamp: Date.now(),
 							author: "offer-create",
 							op: {
@@ -1871,7 +1876,26 @@ const program: ProgramDef = {
 	actor: actorDef,
 	validator: (changes: Change[], context?: import("../runtime.js").BatchValidationContext): ValidationResult => {
 		for (const change of changes) {
-			// Try bucket classification first
+			const createOp = change.ops?.find((o) => o.objectCreate);
+			const typeKey = createOp?.objectCreate?.typeKey;
+
+			// Route by typeKey when objectCreate is present.
+			if (typeKey === OFFER_TYPE_KEY) {
+				const offerC = classifyOfferChange(change);
+				if (offerC.kind !== "Unknown") {
+					if (offerC.kind === "Genesis") {
+						const ops = change.ops ?? [];
+						const hasMaker = ops.some((o) => o.fieldSet?.key === "maker_pubkey");
+						const hasTerms = ops.some((o) => o.fieldSet?.key === "terms");
+						if (!hasMaker) return { valid: false, error: "offer: genesis missing maker_pubkey" };
+						if (!hasTerms) return { valid: false, error: "offer: genesis missing terms" };
+					}
+					continue;
+				}
+				return { valid: false, error: `coin: unrecognised offer change for ${change.objectId}` };
+			}
+
+			// Try bucket classification (chain.coin.bucket or no typeKey)
 			const bucketC = classifyBucketChange(change);
 			if (bucketC.kind !== "Unknown") {
 				if (bucketC.kind === "Genesis") {
@@ -1880,19 +1904,6 @@ const program: ProgramDef = {
 						o.fieldSet?.key === "token_id" && o.fieldSet.value?.linkValue?.targetId
 					);
 					if (!hasTokenLink) return { valid: false, error: "coin: bucket genesis missing token_id link" };
-				}
-				continue;
-			}
-
-			// Try offer classification
-			const offerC = classifyOfferChange(change);
-			if (offerC.kind !== "Unknown") {
-				if (offerC.kind === "Genesis") {
-					const ops = change.ops ?? [];
-					const hasMaker = ops.some((o) => o.fieldSet?.key === "maker_pubkey");
-					const hasTerms = ops.some((o) => o.fieldSet?.key === "terms");
-					if (!hasMaker) return { valid: false, error: "offer: genesis missing maker_pubkey" };
-					if (!hasTerms) return { valid: false, error: "offer: genesis missing terms" };
 				}
 				continue;
 			}
