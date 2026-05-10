@@ -401,7 +401,16 @@ const objectActor = actor({
 
 			const validator = getValidator(effectiveTypeKey);
 			if (validator) {
-				const context: BatchValidationContext = { allChanges: decoded };
+				// Extract signer pubkey from first change's auth extension for validator use.
+				let signerPubkey: string | undefined;
+				const firstChange = decoded[0];
+				if (firstChange?.authExtension?.type === "ed25519" && firstChange.authExtension.payload) {
+					try {
+						const sig = decodeSignature(firstChange.authExtension.payload);
+						signerPubkey = Buffer.from(sig.pubkey).toString("hex");
+					} catch { /* ignore — validator will run without signer hint */ }
+				}
+				const context: BatchValidationContext = { allChanges: decoded, signerPubkey };
 				const result = validator(decoded, context);
 				if (!result.valid) {
 					throw new Error(`Validation rejected: ${result.error}`);
@@ -1026,7 +1035,16 @@ const storeActor = actor({
 				const effectiveTypeKey = typeKeyMap.get(objectId)!;
 				const validator = getValidator(effectiveTypeKey);
 				if (validator) {
-					const result = validator(changes, batchContext);
+					// Extract signer pubkey from first change's auth extension.
+					let signerPubkey: string | undefined;
+					const firstChange = changes[0];
+					if (firstChange?.authExtension?.type === "ed25519" && firstChange.authExtension.payload) {
+						try {
+							const sig = decodeSignature(firstChange.authExtension.payload);
+							signerPubkey = Buffer.from(sig.pubkey).toString("hex");
+						} catch { /* ignore */ }
+					}
+					const result = validator(changes, { ...batchContext, signerPubkey });
 					if (!result.valid) {
 						throw new Error(`Validation rejected for ${objectId}: ${result.error}`);
 					}

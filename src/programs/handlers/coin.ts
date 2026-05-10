@@ -14,9 +14,9 @@
 // the SQL index hook at module load.
 
 import type { ProgramDef, ProgramContext, ProgramActorDef, ValidationResult, Block } from "../runtime.js";
-import type { Change } from "../../proto.js";
-	import { encodeChange, decodeChange } from "../../proto.js";
-import {
+	import type { Change } from "../../proto.js";
+	import { encodeChange, decodeChange, encodeChangeBundle, decodeChangeBundle } from "../../proto.js";
+	import {
 	parseUint,
 	addBounded,
 	subChecked,
@@ -1031,54 +1031,92 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 			}
 
 			if (sub === "cancel") {
-				const offerId = rest[0];
-				if (!offerId) { print(red("Usage: coin offer cancel <offer_id> [--key=name]")); break; }
-				try {
-					const offerObj = await store.get(offerId);
-					if (!offerObj || offerObj.typeKey !== OFFER_TYPE_KEY) {
-						print(red("Not found or not an offer: ") + offerId);
-						break;
-					}
-					const makerPubkey = extractStr(offerObj.fields?.maker_pubkey);
-					const keyInfo: any = await dispatchProgram("/wallet", "show", [keyName]);
-					if (!keyInfo) { print(red(`Wallet key "${keyName}" not found`)); break; }
-					const signerPubkey = keyInfo.pubkey as string;
-					if (signerPubkey !== makerPubkey) {
-						print(red("Only the maker can cancel an offer"));
-						break;
-					}
+			const offerId = rest[0];
+			if (!offerId) { print(red("Usage: coin offer cancel <offer_id> [--key=name]")); break; }
+			try {
+				const offerObj = await store.get(offerId);
+				if (!offerObj || offerObj.typeKey !== OFFER_TYPE_KEY) {
+					print(red("Not found or not an offer: ") + offerId);
+					break;
+				}
+				const makerPubkey = extractStr(offerObj.fields?.maker_pubkey);
+				const keyInfo = await dispatchProgram("/wallet", "show", [keyName]);
+				if (!keyInfo) { print(red(`Wallet key "${keyName}" not found`)); break; }
+				const signerPubkey = keyInfo.pubkey;
+				if (signerPubkey !== makerPubkey) {
+					print(red("Only the maker can cancel an offer"));
+					break;
+				}
 
-					const cancelChange = buildCoinOpChange({
+				const state = replayOffer(offerObj.blocks ?? []);
+				if (state.status !== "open" && state.status !== "funded") {
+					print(red("Offer is already " + state.status));
+					break;
+				}
+
+				const batchEntries = [];
+
+				// 1. Create return outputs for each escrowed coin (maker gets their coins back)
+				for (const [coinId, escrow] of state.escrowed) {
+					if (escrow.spent) continue;
+					const returnChange = buildCoinOpChange({
 						bucketId: offerId,
 						parentIds: [],
 						timestamp: Date.now(),
 						author: "offer-cancel",
 						op: {
-							kind: "offer_cancel",
+							kind: "create",
 							coinId: randomUUID().replace(/-/g, "").slice(0, 16),
+							ownerPubkey: escrow.owner,
+							amount: escrow.amount,
+							tokenId: escrow.tokenId,
 						},
 						blockId: randomUUID().replace(/-/g, "").slice(0, 16),
 					});
-					const cancelB64 = Buffer.from(encodeChange(cancelChange)).toString("base64");
-					const nonce: number = await dispatchProgram("/consensus", "getNonce", [signerPubkey]) as number;
-					const { changeB64: signedCancelB64 } = await dispatchProgram("/wallet", "signChange", [{
+					const returnB64 = Buffer.from(encodeChange(returnChange)).toString("base64");
+					const nonce = await dispatchProgram("/consensus", "getNonce", [signerPubkey]);
+					const { changeB64: signedReturnB64 } = await dispatchProgram("/wallet", "signChange", [{
 						name: keyName,
-						changeB64: cancelB64,
+						changeB64: returnB64,
 						nonce: nonce + 1,
-						fee: 10,
-					}]) as { changeB64: string };
-
-					const offerActor = objectActor(offerId);
-					await offerActor.pushChanges(signedCancelB64);
-
-					print(green("Offer cancelled. Escrow returned to maker."));
-					print(dim("  offer: ") + offerId);
-				} catch (err: any) {
-					print(red("Error: ") + (err?.message ?? String(err)));
+						fee: 1,
+					}]);
+					batchEntries.push({ objectId: offerId, changesBase64: signedReturnB64 });
 				}
 
-				break;
+				// 2. Cancel the offer
+				const cancelChange = buildCoinOpChange({
+					bucketId: offerId,
+					parentIds: [],
+					timestamp: Date.now(),
+					author: "offer-cancel",
+					op: {
+						kind: "offer_cancel",
+						coinId: randomUUID().replace(/-/g, "").slice(0, 16),
+					},
+					blockId: randomUUID().replace(/-/g, "").slice(0, 16),
+				});
+				const cancelB64 = Buffer.from(encodeChange(cancelChange)).toString("base64");
+				const nonce = await dispatchProgram("/consensus", "getNonce", [signerPubkey]);
+				const { changeB64: signedCancelB64 } = await dispatchProgram("/wallet", "signChange", [{
+					name: keyName,
+					changeB64: cancelB64,
+					nonce: nonce + 1,
+					fee: 10,
+				}]);
+				batchEntries.push({ objectId: offerId, changesBase64: signedCancelB64 });
+
+				await store.pushChangesBatch(JSON.stringify(batchEntries));
+
+				print(green("Offer cancelled. Escrow returned to maker as claimable outputs."));
+				print(dim("  offer: ") + offerId);
+				print(dim("  returned: ") + state.escrowed.size + " coin(s)");
+			} catch (err) {
+				print(red("Error: ") + (err?.message ?? String(err)));
 			}
+
+			break;
+		}
 
 			if (sub === "claim") {
 				const offerId = rest[0];
@@ -1093,13 +1131,16 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 					if (!keyInfo) { print(red(`Wallet key "${keyName}" not found`)); break; }
 					const claimerPubkey = keyInfo.pubkey as string;
 
-					const state = replayOffer(offerObj.blocks ?? []);
-					const myOutputs = Array.from(state.outputs.entries()).filter(([_, o]) => o.owner === claimerPubkey && !o.spent);
-					if (myOutputs.length === 0) {
-						print(dim("No claimable outputs for this key."));
-						break;
-					}
-
+				const state = replayOffer(offerObj.blocks ?? []);
+				if (state.status !== "settled" && state.status !== "cancelled") {
+					print(red("Offer is not ready for claim (status: " + state.status + ")"));
+					break;
+				}
+				const myOutputs = Array.from(state.outputs.entries()).filter(([_, o]) => o.owner === claimerPubkey && !o.spent);
+				if (myOutputs.length === 0) {
+					print(dim("No claimable outputs for this key."));
+					break;
+				}
 					const batchEntries: Array<{ objectId: string; changesBase64: string }> = [];
 					for (const [coinId, out] of myOutputs) {
 						// Find or create a bucket for this token
@@ -1273,22 +1314,28 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 						print(red("Not found or not an offer: ") + offerId);
 						break;
 					}
-					const offerFile = {
-						version: 1,
-						offer_id: offerId,
-						nonce: extractStr(obj.fields?.nonce),
-						maker_pubkey: extractStr(obj.fields?.maker_pubkey),
-						terms: JSON.parse(extractStr(obj.fields?.terms)),
-						status: extractStr(obj.fields?.status),
-						timestamp: obj.updatedAt,
-					};
-					const json = JSON.stringify(offerFile, null, 2);
+					// Gather all changes for this offer from disk.
+					const fs = await import("node:fs");
+					const path = await import("node:path");
+					const os = await import("node:os");
+					const dataDir = process.env.GLON_DATA ?? path.join(os.homedir(), ".glon");
+					const changeDir = path.join(dataDir, "changes", offerId);
+					const files = fs.readdirSync(changeDir).filter((f: string) => f.endsWith(".pb"));
+					const changeBytes: Uint8Array[] = [];
+					for (const f of files.sort()) {
+						const raw = fs.readFileSync(path.join(changeDir, f));
+						// Decode then re-encode to normalize.
+						const change = decodeChange(new Uint8Array(raw));
+						changeBytes.push(encodeChange(change));
+					}
+					const bundle = { changes: changeBytes };
+					const bundleBytes = encodeChangeBundle(bundle);
 					if (fileArg) {
-						const fs = await import("node:fs");
-						fs.writeFileSync(fileArg.split("=")[1], json);
-						print(green("Offer exported to ") + fileArg.split("=")[1]);
+						const outPath = fileArg.split("=")[1];
+						fs.writeFileSync(outPath, Buffer.from(bundleBytes));
+						print(green(`Exported ${changeBytes.length} changes to ${outPath} (${bundleBytes.length} bytes)`));
 					} else {
-						print(json);
+						print(Buffer.from(bundleBytes).toString("base64"));
 					}
 				} catch (err: any) {
 					print(red("Error: ") + (err?.message ?? String(err)));
@@ -1301,29 +1348,40 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				if (!filePath) { print(red("Usage: coin offer import <file>")); break; }
 				try {
 					const fs = await import("node:fs");
-					const json = fs.readFileSync(filePath, "utf-8");
-					const offerFile = JSON.parse(json);
-					print(bold("Imported offer:"));
-					print(dim("  id:     ") + offerFile.offer_id);
-					print(dim("  status: ") + cyan(offerFile.status));
-					print(dim("  maker:  ") + (offerFile.maker_pubkey?.slice(0, 16) + "..." || "?"));
-					if (offerFile.terms) {
-						print(dim("  offered:"));
-						for (const o of offerFile.terms.offered) {
-							print(`    ${o.amount} ${cyan(o.tokenId?.slice(0, 12) + "...")}`);
-						}
-						print(dim("  requested:"));
-						for (const o of offerFile.terms.requested) {
-							print(`    ${o.amount} ${cyan(o.tokenId?.slice(0, 12) + "...")}`);
-						}
+					const raw = fs.readFileSync(filePath);
+					const bundle = decodeChangeBundle(new Uint8Array(raw));
+					let imported = 0;
+					let offerId: string | null = null;
+					for (const changeBytes of bundle.changes) {
+						const change = decodeChange(changeBytes);
+						const actor = objectActor(change.objectId, { createWithInput: { id: change.objectId } });
+						await actor.pushChanges(Buffer.from(changeBytes).toString("base64"));
+						imported++;
+						if (!offerId) offerId = change.objectId;
 					}
-					print(dim("\nTo accept: coin offer accept ") + offerFile.offer_id + " --key=<your-key>");
+					if (!offerId) {
+						print(red("No changes found in bundle"));
+						break;
+					}
+					const obj = await store.get(offerId);
+					if (!obj || obj.typeKey !== OFFER_TYPE_KEY) {
+						print(red("Imported changes do not form a valid offer"));
+						break;
+					}
+					print(green(`Imported ${imported} changes for offer ${offerId}`));
+					print(dim("  status: ") + cyan(extractStr(obj.fields?.status)));
+					const termsJson = extractStr(obj.fields?.terms);
+					if (termsJson) {
+						const terms = JSON.parse(termsJson) as OfferTerms;
+						print(dim("  offered: ") + terms.offered.map((o) => `${o.amount} ${o.tokenId.slice(0, 8)}...`).join(", "));
+						print(dim("  requested: ") + terms.requested.map((o) => `${o.amount} ${o.tokenId.slice(0, 8)}...`).join(", "));
+					}
+					print(dim("  maker: ") + (extractStr(obj.fields?.maker_pubkey)?.slice(0, 16) + "..." || "?"));
 				} catch (err: any) {
 					print(red("Error: ") + (err?.message ?? String(err)));
 				}
 				break;
 			}
-
 
 			print([
 				bold("  Offer") + dim(" — peer-to-peer atomic swaps via chain.coin.offer"),
@@ -1333,8 +1391,8 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				`    ${cyan("coin offer claim")} ${dim("<offer_id> [--key=name]")}                              claim settled outputs`,
 				`    ${cyan("coin offer list")} ${dim("")}                                         all open offers`,
 				`    ${cyan("coin offer info")} ${dim("<offer_id>")}                                details + state`,
-				`    ${cyan("coin offer export")} ${dim("<offer_id> [--file=path]")}                    JSON offer file`,
-				`    ${cyan("coin offer import")} ${dim("<file>")}                                  inspect offer file`,
+				`    ${cyan("coin offer export")} ${dim("<offer_id> [--file=path]")}                    export ChangeBundle`,
+				`    ${cyan("coin offer import")} ${dim("<file>")}                                  import ChangeBundle`,
 				dim("  Uses cross-object batch validation (pushChangesBatch) for atomic settlement."),
 			].join("\n"));
 			break;
@@ -1548,10 +1606,18 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 					const priorBlocks = obj?.blocks ?? [];
 					const typeKey = obj?.typeKey ?? "";
 					const change = decodeChange(new Uint8Array(Buffer.from(input.changeB64, "base64")));
-					if (typeKey === OFFER_TYPE_KEY) {
-						return validateOfferChange(change, priorBlocks);
+					// Extract signer pubkey from auth extension for ownership checks.
+					let signerPubkey: string | undefined;
+					if (change.authExtension?.type === "ed25519" && change.authExtension.payload) {
+						try {
+							const sig = decodeSignature(change.authExtension.payload);
+							signerPubkey = Buffer.from(sig.pubkey).toString("hex");
+						} catch { /* ignore */ }
 					}
-					return validateBucketChange(change, priorBlocks);
+					if (typeKey === OFFER_TYPE_KEY) {
+						return validateOfferChange(change, priorBlocks, signerPubkey, obj?.fields);
+					}
+					return validateBucketChange(change, priorBlocks, signerPubkey);
 				},
 			},
 
@@ -1693,124 +1759,6 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				},
 			},
 
-			gift: {
-				description: "Create a gift offer — escrow coins with zero requested. Recipient calls offer accept + claim.",
-				inputSchema: {
-					type: "object",
-					required: ["token_id", "amount", "recipient_pubkey"],
-					properties: {
-						token_id: { type: "string" },
-						amount: { type: "string" },
-						recipient_pubkey: { type: "string" },
-						key_name: { type: "string" },
-					},
-				},
-				handler: async (ctx: ProgramContext, input: {
-					token_id: string;
-					amount: string;
-					recipient_pubkey: string;
-					key_name?: string;
-				}): Promise<{ offer_id: string }> => {
-					const { dispatchProgram, store, resolveId, objectActor, randomUUID } = ctx;
-					const storeAny = store as any;
-					const keyName = input.key_name ?? "default";
-
-					const keyInfo: any = await dispatchProgram("/wallet", "show", [keyName]);
-					if (!keyInfo) throw new Error(`Wallet key "${keyName}" not found`);
-					const makerPubkey = keyInfo.pubkey as string;
-
-					const tokenId = (await resolveId(input.token_id)) ?? input.token_id;
-					const amount = input.amount;
-
-					// Select coins
-					const selected = await storeAny.coinSelect(tokenId, makerPubkey, amount) as { coin_id: string; bucket_id: string; amount: string }[];
-					let sum = 0n;
-					for (const c of selected) sum += BigInt(c.amount);
-					if (sum < BigInt(amount)) throw new Error(`Insufficient balance: have ${sum.toString()}, need ${amount}`);
-
-					const offerId = randomUUID().replace(/-/g, "").slice(0, 24);
-					const batchEntries: Array<{ objectId: string; changesBase64: string }> = [];
-
-					// 1. Spend maker's coins
-					for (const coin of selected) {
-						const bucketActor = objectActor(coin.bucket_id);
-						const heads = await bucketActor.getHeads() as string[];
-						const spendChange = buildCoinOpChange({
-							bucketId: coin.bucket_id,
-							parentIds: heads.map(hexDecode),
-							timestamp: Date.now(),
-							author: "gift-create",
-							op: { kind: "spend", coinId: coin.coin_id },
-							blockId: randomUUID().replace(/-/g, "").slice(0, 16),
-						});
-						const spendB64 = Buffer.from(encodeChange(spendChange)).toString("base64");
-						const nonce: number = await dispatchProgram("/consensus", "getNonce", [makerPubkey]) as number;
-						const { changeB64: signedB64 } = await dispatchProgram("/wallet", "signChange", [{
-							name: keyName,
-							changeB64: spendB64,
-							nonce: nonce + 1,
-							fee: 1,
-						}]) as { changeB64: string };
-						batchEntries.push({ objectId: coin.bucket_id, changesBase64: signedB64 });
-					}
-
-					// 2. Offer genesis with empty requested
-					const terms: OfferTerms = {
-						offered: [{ tokenId, amount }],
-						requested: [],
-					};
-					const genesisResult = await dispatchProgram("/coin", "buildOfferGenesis", [{
-						offerId,
-						timestamp: Date.now(),
-						author: "gift-create",
-						makerPubkey,
-						terms,
-					}]) as { changeB64: string };
-					const genesisNonce: number = await dispatchProgram("/consensus", "getNonce", [makerPubkey]) as number;
-					const { changeB64: signedGenesisB64 } = await dispatchProgram("/wallet", "signChange", [{
-						name: keyName,
-						changeB64: genesisResult.changeB64,
-						nonce: genesisNonce + 1,
-						fee: 10,
-					}]) as { changeB64: string };
-					batchEntries.push({ objectId: offerId, changesBase64: signedGenesisB64 });
-
-					// 3. Escrow into offer
-					for (const coin of selected) {
-						const escrowChange = buildCoinOpChange({
-							bucketId: offerId,
-							parentIds: [],
-							timestamp: Date.now(),
-							author: "gift-create",
-							op: {
-								kind: "offer_escrow",
-								coinId: coin.coin_id,
-								ownerPubkey: makerPubkey,
-								amount: coin.amount,
-								tokenId,
-							},
-							blockId: randomUUID().replace(/-/g, "").slice(0, 16),
-						});
-						const escrowB64 = Buffer.from(encodeChange(escrowChange)).toString("base64");
-						const nonce: number = await dispatchProgram("/consensus", "getNonce", [makerPubkey]) as number;
-						const { changeB64: signedEscrowB64 } = await dispatchProgram("/wallet", "signChange", [{
-							name: keyName,
-							changeB64: escrowB64,
-							nonce: nonce + 1,
-							fee: 10,
-						}]) as { changeB64: string };
-						batchEntries.push({ objectId: offerId, changesBase64: signedEscrowB64 });
-					}
-
-					// 4. Push changes individually
-					for (const entry of batchEntries) {
-						const actor = objectActor(entry.objectId, { createWithInput: { id: entry.objectId } });
-						await actor.pushChanges(entry.changesBase64);
-					}
-
-					return { offer_id: offerId };
-				},
-			},
 			mint: {
 				description: "Mint new coins (owner only). Creates a coin in the owner's bucket.",
 				inputSchema: {

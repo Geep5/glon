@@ -134,119 +134,172 @@ export function buildOfferGenesisChange(args: {
 	return { kind: "Op", ops: coinOps };
 }
 
-export function validateOfferChange(
-	change: Change,
-	priorBlocks: Block[],
-	_batchContext?: import("../runtime.js").BatchValidationContext,
-): ValidationResult {
-	const classification = classifyOfferChange(change);
+	export function validateOfferChange(
+		change: Change,
+		priorBlocks: Block[],
+		_signerPubkey?: string,
+		fields?: Record<string, any>,
+	): ValidationResult {
+		const classification = classifyOfferChange(change);
 
-	if (classification.kind === "Unknown") {
-		return { valid: false, error: `offer: ${classification.reason}` };
-	}
-	if (classification.kind === "Genesis") {
-		if (priorBlocks.length > 0) return { valid: false, error: "offer: genesis must be first change" };
-		const ops = change.ops ?? [];
-		const hasMaker = ops.some((o) => o.fieldSet?.key === "maker_pubkey");
-		const hasTerms = ops.some((o) => o.fieldSet?.key === "terms");
-		if (!hasMaker) return { valid: false, error: "offer: genesis missing maker_pubkey" };
-		if (!hasTerms) return { valid: false, error: "offer: genesis missing terms" };
-		return { valid: true };
-	}
-
-	const state = replayOffer(priorBlocks);
-	const ops = classification.ops;
-
-	// Only one offer state-changing op per change
-	const stateOps = ops.filter((o) => o.kind === "offer_escrow" || o.kind === "offer_pay" || o.kind === "offer_settle" || o.kind === "offer_cancel");
-	if (stateOps.length > 1) {
-		return { valid: false, error: "offer: only one state op per change" };
-	}
-
-	for (const op of ops) {
-		if (op.kind === "offer_escrow") {
-			if (state.status !== "open") return { valid: false, error: "offer: escrow only when open" };
-			if (!op.ownerPubkey || !op.amount) {
-				return { valid: false, error: "offer: escrow missing owner_pubkey or amount" };
-			}
-			try {
-				parseUint(op.amount);
-			} catch (e: any) {
-				return { valid: false, error: `offer: escrow bad amount: ${e.message}` };
-			}
-			if (state.escrowed.has(op.coinId)) {
-				return { valid: false, error: "offer: duplicate escrow coin_id" };
-			}
+		if (classification.kind === "Unknown") {
+			return { valid: false, error: `offer: ${classification.reason}` };
 		}
-
-		if (op.kind === "offer_pay") {
-			if (state.status !== "open" && state.status !== "funded") {
-				return { valid: false, error: "offer: pay only when open or funded" };
-			}
-			if (!op.ownerPubkey || !op.amount) {
-				return { valid: false, error: "offer: pay missing owner_pubkey or amount" };
-			}
-			try {
-				parseUint(op.amount);
-			} catch (e: any) {
-				return { valid: false, error: `offer: pay bad amount: ${e.message}` };
-			}
-			if (state.payments.has(op.coinId)) {
-				return { valid: false, error: "offer: duplicate payment coin_id" };
-			}
-		}
-
-		if (op.kind === "offer_settle") {
-			// v1: allow settle when open because payments may be in the same batch.
-			// In v2 we can cross-check batchContext for payment blocks.
-			if (state.status !== "open" && state.status !== "funded") {
-				return { valid: false, error: "offer: settle only when open or funded" };
-			}
-			if (!op.outputs) {
-				return { valid: false, error: "offer: settle missing outputs" };
-			}
-			let parsedOutputs: Array<{ coin_id: string; owner_pubkey: string; amount: string; token_id: string }>;
-			try {
-				parsedOutputs = JSON.parse(op.outputs);
-			} catch {
-				return { valid: false, error: "offer: settle outputs invalid JSON" };
-			}
-			if (!Array.isArray(parsedOutputs) || parsedOutputs.length === 0) {
-				return { valid: false, error: "offer: settle outputs must be non-empty array" };
-			}
-			for (const out of parsedOutputs) {
+		if (classification.kind === "Genesis") {
+			if (priorBlocks.length > 0) return { valid: false, error: "offer: genesis must be first change" };
+			const ops = change.ops ?? [];
+			const hasMaker = ops.some((o) => o.fieldSet?.key === "maker_pubkey");
+			const hasTerms = ops.some((o) => o.fieldSet?.key === "terms");
+			if (!hasMaker) return { valid: false, error: "offer: genesis missing maker_pubkey" };
+			if (!hasTerms) return { valid: false, error: "offer: genesis missing terms" };
+			const termsOp = ops.find((o) => o.fieldSet?.key === "terms");
+			if (termsOp?.fieldSet?.value?.stringValue) {
 				try {
-					parseUint(out.amount);
+					const terms = JSON.parse(termsOp.fieldSet.value.stringValue) as { requested?: any[] };
+					if (!terms.requested || terms.requested.length === 0) {
+						return { valid: false, error: "offer: must request at least one token" };
+					}
+				} catch { /* ignore malformed terms */ }
+			}
+			return { valid: true };
+		}
+
+		const state = replayOffer(priorBlocks);
+		const ops = classification.ops;
+
+		// Only one offer state-changing op per change
+		const stateOps = ops.filter((o) => o.kind === "offer_escrow" || o.kind === "offer_pay" || o.kind === "offer_settle" || o.kind === "offer_cancel");
+		if (stateOps.length > 1) {
+			return { valid: false, error: "offer: only one state op per change" };
+		}
+
+		// Helper to read terms from fields
+		let terms: { offered: Array<{ tokenId: string; amount: string }>; requested: Array<{ tokenId: string; amount: string }> } | null = null;
+		if (fields?.terms?.stringValue) {
+			try { terms = JSON.parse(fields.terms.stringValue); } catch { /* ignore */ }
+		}
+		const makerPubkey = fields?.maker_pubkey?.stringValue ?? "";
+
+		for (const op of ops) {
+			if (op.kind === "offer_escrow") {
+				if (state.status !== "open") return { valid: false, error: "offer: escrow only when open" };
+				if (!op.ownerPubkey || !op.amount) {
+					return { valid: false, error: "offer: escrow missing owner_pubkey or amount" };
+				}
+				try {
+					parseUint(op.amount);
 				} catch (e: any) {
-					return { valid: false, error: `offer: settle output bad amount: ${e.message}` };
+					return { valid: false, error: `offer: escrow bad amount: ${e.message}` };
+				}
+				if (state.escrowed.has(op.coinId)) {
+					return { valid: false, error: "offer: duplicate escrow coin_id" };
+				}
+			}
+
+			if (op.kind === "offer_pay") {
+				if (state.status !== "open" && state.status !== "funded") {
+					return { valid: false, error: "offer: pay only when open or funded" };
+				}
+				if (!op.ownerPubkey || !op.amount) {
+					return { valid: false, error: "offer: pay missing owner_pubkey or amount" };
+				}
+				try {
+					parseUint(op.amount);
+				} catch (e: any) {
+					return { valid: false, error: `offer: pay bad amount: ${e.message}` };
+				}
+				if (state.payments.has(op.coinId)) {
+					return { valid: false, error: "offer: duplicate payment coin_id" };
+				}
+			}
+
+			if (op.kind === "offer_settle") {
+				// v1: allow settle when open because payments may be in the same batch.
+				if (state.status !== "open" && state.status !== "funded") {
+					return { valid: false, error: "offer: settle only when open or funded" };
+				}
+				if (!op.outputs) {
+					return { valid: false, error: "offer: settle missing outputs" };
+				}
+				let parsedOutputs: Array<{ coin_id: string; owner_pubkey: string; amount: string; token_id: string }>;
+				try {
+					parsedOutputs = JSON.parse(op.outputs);
+				} catch {
+					return { valid: false, error: "offer: settle outputs invalid JSON" };
+				}
+				if (!Array.isArray(parsedOutputs) || parsedOutputs.length === 0) {
+					return { valid: false, error: "offer: settle outputs must be non-empty array" };
+				}
+				for (const out of parsedOutputs) {
+					try {
+						parseUint(out.amount);
+					} catch (e: any) {
+						return { valid: false, error: `offer: settle output bad amount: ${e.message}` };
+					}
+				}
+
+				// Conservation of value: requested tokens go to maker, offered tokens go to payers.
+				if (terms) {
+					// Reject zero-requested offers (offers must have something requested)
+					if (terms.requested.length === 0) {
+						return { valid: false, error: "offer: must request at least one token" };
+					}
+
+					// Maker must receive exactly the requested amount for each requested token.
+					for (const req of terms.requested) {
+						const totalToMaker = parsedOutputs
+							.filter((o) => o.token_id === req.tokenId && o.owner_pubkey === makerPubkey)
+							.reduce((a, b) => a + BigInt(b.amount), 0n);
+						if (totalToMaker !== BigInt(req.amount)) {
+							return { valid: false, error: `offer: settle does not pay maker ${req.amount} ${req.tokenId}` };
+						}
+					}
+
+					// Offered tokens: outputs to non-maker must equal escrowed amount.
+					for (const off of terms.offered) {
+						const escrowSum = Array.from(state.escrowed.values())
+							.filter((c) => c.tokenId === off.tokenId)
+							.reduce((a, b) => a + BigInt(b.amount), 0n);
+						const outputSum = parsedOutputs
+							.filter((o) => o.token_id === off.tokenId && o.owner_pubkey !== makerPubkey)
+							.reduce((a, b) => a + BigInt(b.amount), 0n);
+						if (escrowSum !== outputSum || outputSum !== BigInt(off.amount)) {
+							return { valid: false, error: `offer: settle output mismatch for ${off.tokenId}` };
+						}
+					}
+				}
+			}
+
+			if (op.kind === "offer_cancel") {
+				if (state.status !== "open" && state.status !== "funded") {
+					return { valid: false, error: "offer: cancel only when open or funded" };
+				}
+				if (_signerPubkey && makerPubkey && _signerPubkey !== makerPubkey) {
+					return { valid: false, error: "offer: only maker can cancel" };
+				}
+			}
+
+			if (op.kind === "create") {
+				// Output coins after settlement — standard create validation
+				if (!op.ownerPubkey || !op.amount) {
+					return { valid: false, error: "offer: create output missing owner_pubkey or amount" };
+				}
+				try {
+					parseUint(op.amount);
+				} catch (e: any) {
+					return { valid: false, error: `offer: create output bad amount: ${e.message}` };
+				}
+			}
+
+			if (op.kind === "spend") {
+				// Spending an output coin (claim)
+				const out = state.outputs.get(op.coinId);
+				if (!out) return { valid: false, error: "offer: spend of unknown output coin" };
+				if (_signerPubkey && out.owner !== _signerPubkey) {
+					return { valid: false, error: "offer: spend signer does not own output" };
 				}
 			}
 		}
 
-		if (op.kind === "offer_cancel") {
-			if (state.status !== "open" && state.status !== "funded") {
-				return { valid: false, error: "offer: cancel only when open or funded" };
-			}
-		}
-
-		if (op.kind === "create") {
-			// Output coins after settlement — standard create validation
-			if (!op.ownerPubkey || !op.amount) {
-				return { valid: false, error: "offer: create output missing owner_pubkey or amount" };
-			}
-			try {
-				parseUint(op.amount);
-			} catch (e: any) {
-				return { valid: false, error: `offer: create output bad amount: ${e.message}` };
-			}
-		}
-
-		if (op.kind === "spend") {
-			// Spending an output coin (claim)
-			const out = state.outputs.get(op.coinId);
-			if (!out) return { valid: false, error: "offer: spend of unknown output coin" };
-		}
+		return { valid: true };
 	}
-
-	return { valid: true };
-}

@@ -267,4 +267,268 @@ describe("coin offer", () => {
     assert.strictEqual(result.valid, false);
     assert.ok(result.error?.includes("only when open or funded"));
   });
+	it("rejects genesis with empty requested", () => {
+		const terms: OfferTerms = {
+			offered: [{ tokenId, amount: "100" }],
+			requested: [],
+		};
+		const genesis = buildOfferGenesisChange({
+			offerId: "o1",
+			timestamp: 1,
+			author: "a",
+			makerPubkey,
+			terms: JSON.stringify(terms),
+		});
+		const result = validateOfferChange(genesis, []);
+		assert.strictEqual(result.valid, false);
+		assert.ok(result.error?.includes("must request at least one token"));
+	});
+
+	it("rejects cancel by non-maker", () => {
+		const genesis = buildOfferGenesisChange({
+			offerId: "o1",
+			timestamp: 1,
+			author: "a",
+			makerPubkey,
+			terms: JSON.stringify(offerTerms),
+		});
+		const escrow = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 2,
+			author: "a",
+			op: { kind: "offer_escrow", coinId: "e1", ownerPubkey: makerPubkey, amount: "100", tokenId },
+			blockId: "b1",
+		});
+		const cancel = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 3,
+			author: "a",
+			op: { kind: "offer_cancel", coinId: "c1" },
+			blockId: "b2",
+		});
+		const result = validateOfferChange(
+			cancel,
+			[getBlock(escrow)],
+			takerPubkey,
+			{ maker_pubkey: { stringValue: makerPubkey }, terms: { stringValue: JSON.stringify(offerTerms) } },
+		);
+		assert.strictEqual(result.valid, false);
+		assert.ok(result.error?.includes("only maker can cancel"));
+	});
+
+	it("rejects settle missing requested totals (conservation)", () => {
+		const escrow = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 1,
+			author: "a",
+			op: { kind: "offer_escrow", coinId: "e1", ownerPubkey: makerPubkey, amount: "100", tokenId },
+			blockId: "b1",
+		});
+		const payment = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 2,
+			author: "a",
+			op: { kind: "offer_pay", coinId: "p1", ownerPubkey: takerPubkey, amount: "50", tokenId },
+			blockId: "b2",
+		});
+		const settle = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 3,
+			author: "a",
+			op: {
+				kind: "offer_settle",
+				coinId: "s1",
+				outputs: JSON.stringify([
+					{ coin_id: "o_taker", owner_pubkey: takerPubkey, amount: "100", token_id: tokenId },
+				]),
+			},
+			blockId: "b3",
+		});
+		const result = validateOfferChange(
+			settle,
+			[getBlock(escrow), getBlock(payment)],
+			undefined,
+			{ maker_pubkey: { stringValue: makerPubkey }, terms: { stringValue: JSON.stringify(offerTerms) } },
+		);
+		assert.strictEqual(result.valid, false);
+		assert.ok(result.error?.includes("does not pay maker"));
+	});
+
+	it("rejects settle missing offered totals (conservation)", () => {
+		const escrow = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 1,
+			author: "a",
+			op: { kind: "offer_escrow", coinId: "e1", ownerPubkey: makerPubkey, amount: "100", tokenId },
+			blockId: "b1",
+		});
+		const payment = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 2,
+			author: "a",
+			op: { kind: "offer_pay", coinId: "p1", ownerPubkey: takerPubkey, amount: "50", tokenId },
+			blockId: "b2",
+		});
+		const settle = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 3,
+			author: "a",
+			op: {
+				kind: "offer_settle",
+				coinId: "s1",
+				outputs: JSON.stringify([
+					{ coin_id: "o_maker", owner_pubkey: makerPubkey, amount: "50", token_id: tokenId },
+				]),
+			},
+			blockId: "b3",
+		});
+		const result = validateOfferChange(
+			settle,
+			[getBlock(escrow), getBlock(payment)],
+			undefined,
+			{ maker_pubkey: { stringValue: makerPubkey }, terms: { stringValue: JSON.stringify(offerTerms) } },
+		);
+		assert.strictEqual(result.valid, false);
+		assert.ok(result.error?.includes("output mismatch"));
+	});
+
+	it("rejects spend of offer output by non-owner", () => {
+		const escrow = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 1,
+			author: "a",
+			op: { kind: "offer_escrow", coinId: "e1", ownerPubkey: makerPubkey, amount: "100", tokenId },
+			blockId: "b1",
+		});
+		const payment = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 2,
+			author: "a",
+			op: { kind: "offer_pay", coinId: "p1", ownerPubkey: takerPubkey, amount: "50", tokenId },
+			blockId: "b2",
+		});
+		const settle = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 3,
+			author: "a",
+			op: {
+				kind: "offer_settle",
+				coinId: "s1",
+				outputs: JSON.stringify([
+					{ coin_id: "o_maker", owner_pubkey: makerPubkey, amount: "50", token_id: tokenId },
+					{ coin_id: "o_taker", owner_pubkey: takerPubkey, amount: "100", token_id: tokenId },
+				]),
+			},
+			blockId: "b3",
+		});
+		const spend = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 4,
+			author: "a",
+			op: { kind: "spend", coinId: "o_maker" },
+			blockId: "b4",
+		});
+		const result = validateOfferChange(
+			spend,
+			[getBlock(escrow), getBlock(payment), getBlock(settle)],
+			takerPubkey,
+		);
+		assert.strictEqual(result.valid, false);
+		assert.ok(result.error?.includes("does not own output"));
+	});
+
+
+	it("cancel returns escrowed coins as outputs", () => {
+		const genesis = buildOfferGenesisChange({
+			offerId: "o1",
+			timestamp: 1,
+			author: "a",
+			makerPubkey,
+			terms: JSON.stringify(offerTerms),
+		});
+		const escrow = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 2,
+			author: "a",
+			op: { kind: "offer_escrow", coinId: "e1", ownerPubkey: makerPubkey, amount: "100", tokenId },
+			blockId: "b1",
+		});
+		const cancel = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 3,
+			author: "a",
+			op: { kind: "offer_cancel", coinId: "c1" },
+			blockId: "b2",
+		});
+		const returnOutput = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 4,
+			author: "a",
+			op: { kind: "create", coinId: "r1", ownerPubkey: makerPubkey, amount: "100", tokenId },
+			blockId: "b3",
+		});
+
+		const state = replayOffer([getBlock(escrow), getBlock(cancel), getBlock(returnOutput)]);
+		assert.strictEqual(state.status, "cancelled");
+		assert.strictEqual(state.outputs.size, 1);
+		assert.strictEqual(state.outputs.get("r1")?.amount, "100");
+		assert.strictEqual(state.outputs.get("r1")?.owner, makerPubkey);
+	});
+
+	it("rejects spend of cancel-return output by non-owner", () => {
+		const escrow = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 1,
+			author: "a",
+			op: { kind: "offer_escrow", coinId: "e1", ownerPubkey: makerPubkey, amount: "100", tokenId },
+			blockId: "b1",
+		});
+		const cancel = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 2,
+			author: "a",
+			op: { kind: "offer_cancel", coinId: "c1" },
+			blockId: "b2",
+		});
+		const returnOutput = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 3,
+			author: "a",
+			op: { kind: "create", coinId: "r1", ownerPubkey: makerPubkey, amount: "100", tokenId },
+			blockId: "b3",
+		});
+		const spend = buildCoinOpChange({
+			bucketId: "o1",
+			parentIds: [],
+			timestamp: 4,
+			author: "a",
+			op: { kind: "spend", coinId: "r1" },
+			blockId: "b4",
+		});
+		const result = validateOfferChange(
+			spend,
+			[getBlock(escrow), getBlock(cancel), getBlock(returnOutput)],
+			takerPubkey,
+		);
+		assert.strictEqual(result.valid, false);
+		assert.ok(result.error?.includes("does not own output"));
+	});
 });

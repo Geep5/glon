@@ -169,6 +169,8 @@ export interface ProgramContext {
 	export interface BatchValidationContext {
 		/** All changes in the batch, across all objects. */
 		allChanges: Change[];
+		/** Hex-encoded Ed25519 pubkey of the signer (from auth extension), if all changes share one. */
+		signerPubkey?: string;
 	}
 
 	/** A program validator function. Receives changes for its object plus optional batch context. */

@@ -122,65 +122,78 @@ export function buildCoinOpChange(args: {
 	return { kind: "Op", op };
 }
 
-export function validateBucketChange(
-	change: Change,
-	priorBlocks: Block[],
-): ValidationResult {
-	const classification = classifyBucketChange(change);
+	export function validateBucketChange(
+		change: Change,
+		priorBlocks: Block[],
+		_signerPubkey?: string,
+	): ValidationResult {
+		const classification = classifyBucketChange(change);
 
-	if (classification.kind === "Unknown") {
-		return { valid: false, error: `coin: ${classification.reason}` };
+		if (classification.kind === "Unknown") {
+			return { valid: false, error: `coin: ${classification.reason}` };
+		}
+		if (classification.kind === "Genesis") {
+			if (priorBlocks.length > 0) return { valid: false, error: "coin: bucket genesis must be first change" };
+			return { valid: true };
+		}
+
+		const state = replayBucket(priorBlocks);
+		const op = classification.op;
+
+		if (op.kind === "create") {
+			if (!op.ownerPubkey || !op.amount) {
+				return { valid: false, error: "coin: create missing owner_pubkey or amount" };
+			}
+			try {
+				parseUint(op.amount);
+			} catch (e: any) {
+				return { valid: false, error: `coin: create bad amount: ${e.message}` };
+			}
+			if (state.coins.size >= MAX_COINS_PER_BUCKET) {
+				return { valid: false, error: "coin: bucket at capacity" };
+			}
+			if (state.coins.has(op.coinId)) {
+				return { valid: false, error: "coin: duplicate coin_id in bucket" };
+			}
+			return { valid: true };
+		}
+
+		if (op.kind === "spend") {
+			const coin = state.coins.get(op.coinId);
+			if (!coin) return { valid: false, error: "coin: spend of unknown coin" };
+			if (coin.spent) return { valid: false, error: "coin: double spend" };
+			if (_signerPubkey && coin.owner !== _signerPubkey) {
+				return { valid: false, error: "coin: spend signer does not own coin" };
+			}
+			return { valid: true };
+		}
+
+		return { valid: false, error: "coin: unreachable" };
 	}
-	if (classification.kind === "Genesis") {
-		if (priorBlocks.length > 0) return { valid: false, error: "coin: bucket genesis must be first change" };
+
+
+	export const validator: ValidatorFn = (changes: Change[], context?: import("../runtime.js").BatchValidationContext): ValidationResult => {
+		const signerPubkey = context?.signerPubkey;
+		for (const change of changes) {
+			const c = classifyBucketChange(change);
+			if (c.kind === "Unknown") return { valid: false, error: `coin: ${c.reason}` };
+			if (c.kind === "Genesis") {
+				const ops = change.ops ?? [];
+				const hasTokenLink = ops.some((o) =>
+					o.fieldSet?.key === "token_id" && o.fieldSet.value?.linkValue?.targetId
+				);
+				if (!hasTokenLink) return { valid: false, error: "coin: bucket genesis missing token_id link" };
+			}
+			if (c.kind === "Op" && c.op.kind === "spend") {
+				// Lightweight ownership check: if we have signer info, verify it matches the
+				// owner declared in the spend op. Full stateful check happens in validate_op.
+				if (signerPubkey && c.op.ownerPubkey && signerPubkey !== c.op.ownerPubkey) {
+					return { valid: false, error: "coin: spend signer does not match op owner" };
+				}
+			}
+		}
 		return { valid: true };
-	}
-
-	const state = replayBucket(priorBlocks);
-	const op = classification.op;
-
-	if (op.kind === "create") {
-		if (!op.ownerPubkey || !op.amount) {
-			return { valid: false, error: "coin: create missing owner_pubkey or amount" };
-		}
-		try {
-			parseUint(op.amount);
-		} catch (e: any) {
-			return { valid: false, error: `coin: create bad amount: ${e.message}` };
-		}
-		if (state.coins.size >= MAX_COINS_PER_BUCKET) {
-			return { valid: false, error: "coin: bucket at capacity" };
-		}
-		if (state.coins.has(op.coinId)) {
-			return { valid: false, error: "coin: duplicate coin_id in bucket" };
-		}
-		return { valid: true };
-	}
-
-	if (op.kind === "spend") {
-		const coin = state.coins.get(op.coinId);
-		if (!coin) return { valid: false, error: "coin: spend of unknown coin" };
-		if (coin.spent) return { valid: false, error: "coin: double spend" };
-		return { valid: true };
-	}
-
-	return { valid: false, error: "coin: unreachable" };
-}
-
-export const validator: ValidatorFn = (changes: Change[]): ValidationResult => {
-	for (const change of changes) {
-		const c = classifyBucketChange(change);
-		if (c.kind === "Unknown") return { valid: false, error: `coin: ${c.reason}` };
-		if (c.kind === "Genesis") {
-			const ops = change.ops ?? [];
-			const hasTokenLink = ops.some((o) =>
-				o.fieldSet?.key === "token_id" && o.fieldSet.value?.linkValue?.targetId
-			);
-			if (!hasTokenLink) return { valid: false, error: "coin: bucket genesis missing token_id link" };
-		}
-	}
-	return { valid: true };
-};
+	};
 
 // ── Index hook ─────────────────────────────────────────────────────
 
