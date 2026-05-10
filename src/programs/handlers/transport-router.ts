@@ -130,7 +130,12 @@ async function doPoll(ctx: ProgramContext): Promise<{ dispatched: number; failed
 					const envelope = decodeTransportEnvelope(payload);
 					const handler = getContentHandler(envelope.contentType);
 					if (handler) {
-						const ok = await handler(envelope, ctx);
+						const blobMeta = {
+							fromEndpoint: blob.from_endpoint,
+							receivedAt: blob.received_at,
+							transportMetadata: blob.metadata ?? {},
+						};
+						const ok = await handler(envelope, ctx, blobMeta);
 						if (ok) dispatched++;
 						else failed++;
 					} else {

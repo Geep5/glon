@@ -80,7 +80,7 @@ const actorDef: ProgramActorDef = {
 					includeTokens: { type: "boolean" },
 				},
 			},
-			async handler(_state, input: any, ctx: ProgramContext) {
+			async handler(ctx: ProgramContext, input: any) {
 				const { offerId, includeTokens } = input;
 				const changes = readOfferChanges(offerId);
 				if (changes.length === 0) throw new Error(`Offer ${offerId} not found on disk`);
@@ -141,7 +141,7 @@ const actorDef: ProgramActorDef = {
 					keyName: { type: "string" },
 				},
 			},
-			async handler(_state, input: any, ctx: ProgramContext) {
+			async handler(ctx: ProgramContext, input: any) {
 				const { bundleBase64 } = input;
 				const bundleBytes = Buffer.from(bundleBase64, "base64");
 				const bundle = decodeChangeBundle(bundleBytes);
@@ -197,12 +197,12 @@ const actorDef: ProgramActorDef = {
 		exportOffer: async (ctx, args) => {
 			const typed = actorDef.typedActions?.exportOffer;
 			if (!typed) throw new Error("exportOffer not defined");
-			return await typed.handler(ctx.state, args[0] ?? {}, ctx);
+			return await typed.handler(ctx, args[0] ?? {});
 		},
 		importOffer: async (ctx, args) => {
 			const typed = actorDef.typedActions?.importOffer;
 			if (!typed) throw new Error("importOffer not defined");
-			return await typed.handler(ctx.state, args[0] ?? {}, ctx);
+			return await typed.handler(ctx, args[0] ?? {});
 		},
 	},
 };

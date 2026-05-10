@@ -579,8 +579,21 @@ registerAuthVerifier("ed25519", (change, payload) => {
 
 /** Handler for incoming transport blobs by content_type.
  *  Receives the decoded TransportEnvelope + parsed payload.
+ *  `blobMeta` carries transport-level metadata that isn't part of the
+ *  signed envelope — most importantly `fromEndpoint`, the address the
+ *  blob arrived from (e.g. `gmail://alice@example.com`). Optional so
+ *  legacy handlers can ignore it.
  *  Returns true if handled, false to fall through. */
-export type ContentHandlerFn = (envelope: { contentType: string; payload: Uint8Array; senderPubkey: Uint8Array; metadata: Record<string, string> }, ctx: ProgramContext) => Promise<boolean>;
+export interface ContentHandlerBlobMeta {
+	fromEndpoint?: string;
+	receivedAt?: number;
+	transportMetadata?: Record<string, string>;
+}
+export type ContentHandlerFn = (
+	envelope: { contentType: string; payload: Uint8Array; senderPubkey: Uint8Array; metadata: Record<string, string> },
+	ctx: ProgramContext,
+	blobMeta?: ContentHandlerBlobMeta,
+) => Promise<boolean>;
 
 const contentHandlers = new Map<string, ContentHandlerFn>();
 
