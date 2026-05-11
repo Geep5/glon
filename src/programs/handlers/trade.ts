@@ -1,22 +1,24 @@
-// swap-email — drives a full atomic swap end-to-end over email.
+// trade — drives a full atomic swap end-to-end over Hyperswarm.
 //
-// User says (from any chat surface): "swap 5 FIG for 10 GOOTECK with bob@x.com".
+// User says (from any chat surface): "trade 5 FIG for 10 GOOTECK with bob".
 // We:
-//   1. Build the offer locally (escrow maker's coins).
-//   2. Export the changes as a ChangeBundle.
-//   3. Send via /transport-gmail with content_type=glon/swap-offer.
-//   4. Watch the inbox. When bob's agent replies with glon/swap-response,
-//      import the changes (which include his payment + signed settlement),
-//      then claim our outputs.
-//   5. On 48h timeout, on incoming glon/swap-decline, or on manual cancel,
-//      cancel the local offer (cancel-return path returns coins to bucket).
+//   1. Resolve `bob` via /peer (must be a TRUSTED peer — see /directory).
+//   2. Build the offer locally (escrow maker's coins).
+//   3. Export the changes as a ChangeBundle.
+//   4. Send via /transport-hyperswarm to bob's hyperswarm pubkey with
+//      content_type=glon/swap-offer.
+//   5. Wait for bob's reply on the persistent pair-topic connection.
+//      On glon/swap-response: import the changes (which include his
+//      payment + signed settlement) and claim our outputs.
+//   6. On 30-min timeout, on incoming glon/swap-decline, or on manual
+//      cancel, cancel the local offer (cancel-return path returns coins
+//      to the maker's bucket).
 //
-// The receiver's flow is symmetric: receive offer → surface to human → on
-// `swap-email accept <id>`, pay + settle + claim, send glon/swap-response;
-// on `swap-email decline <id>` or 20-min approval timeout, send
-// glon/swap-decline.
+// The receiver's flow is symmetric: receive offer → surface to human →
+// on `trade accept <id>`, pay + settle + claim, send glon/swap-response;
+// on `trade decline <id>` or 5-min approval timeout, send glon/swap-decline.
 //
-// Persistence: per-swap state lives in the /swap-email program object's
+// Persistence: per-swap state lives in the /trade program object's
 // `persisted_state` field, same pattern as /discord. Survives daemon restarts.
 //
 // Content handlers for glon/swap-offer, glon/swap-response, glon/swap-decline
@@ -38,10 +40,10 @@ export const SWAP_OFFER_CONTENT_TYPE = "glon/swap-offer";
 export const SWAP_RESPONSE_CONTENT_TYPE = "glon/swap-response";
 export const SWAP_DECLINE_CONTENT_TYPE = "glon/swap-decline";
 
-const DEFAULT_ORIGINATOR_TIMEOUT_S = 172_800;       // 48 h
-const DEFAULT_RECEIVER_APPROVAL_TIMEOUT_S = 1_200;  // 20 min
-const DEFAULT_STATUS_REPORT_INTERVAL_S = 86_400;    // 24 h
-const WATCHER_TICK_MS = 60_000;
+const DEFAULT_ORIGINATOR_TIMEOUT_S = 1_800;         // 30 min (was 48h on email)
+const DEFAULT_RECEIVER_APPROVAL_TIMEOUT_S = 300;    // 5 min  (was 20m on email)
+const DEFAULT_STATUS_REPORT_INTERVAL_S = 0;         // off by default — sub-second transport doesn't need pings
+const WATCHER_TICK_MS = 30_000;
 const SWAP_ID_BYTES = 4; // 8 hex chars
 
 const PERSISTED_STATE_FIELD = "persisted_state";
@@ -66,7 +68,10 @@ export interface SwapState {
 	swap_id: string;
 	role: "originator" | "responder";
 	status: SwapStatus;
-	counterparty_email: string;
+	counterparty_peer_id: string;            // /peer record id (stable, local)
+	counterparty_identity_pubkey: string;    // counterparty's chain identity (ed25519 hex)
+	counterparty_hyperswarm_pubkey: string;  // counterparty's network identity (curve25519 hex) — used for transport routing
+	counterparty_name: string;               // display name from /peer
 	offer_id: string;
 	key_name: string;
 	terms: SwapTermsCompact;
@@ -140,7 +145,7 @@ async function restoreState(state: Record<string, any>, ctx: ProgramContext): Pr
 		}
 		state._lastPersistedSnapshot = snapshotState(state);
 	} catch (err: any) {
-		ctx.print?.(dim(`  [swap-email] restore failed: ${err?.message ?? String(err)}`));
+		ctx.print?.(dim(`  [trade] restore failed: ${err?.message ?? String(err)}`));
 	}
 }
 
@@ -154,7 +159,7 @@ async function persistIfChanged(state: Record<string, any>, ctx: ProgramContext)
 		await actor.setField(PERSISTED_STATE_FIELD, JSON.stringify(ctx.stringVal(snap)));
 		state._lastPersistedSnapshot = snap;
 	} catch (err: any) {
-		ctx.print?.(dim(`  [swap-email] persist failed: ${err?.message ?? String(err)}`));
+		ctx.print?.(dim(`  [trade] persist failed: ${err?.message ?? String(err)}`));
 	}
 }
 
@@ -171,10 +176,10 @@ function setSwap(state: Record<string, any>, swap: SwapState): void {
 
 async function notifyUser(ctx: ProgramContext, text: string, urgency: "low" | "normal" | "high" = "normal"): Promise<void> {
 	try {
-		await ctx.dispatchProgram("/user-chat", "notify", [{ text, urgency, source: "swap-email" }]);
+		await ctx.dispatchProgram("/user-chat", "notify", [{ text, urgency, source: "trade" }]);
 	} catch (err: any) {
 		// /user-chat not running yet — print directly so the message isn't lost.
-		ctx.print?.(`[swap-email${urgency !== "normal" ? ` ${urgency}` : ""}] ${text}`);
+		ctx.print?.(`[trade${urgency !== "normal" ? ` ${urgency}` : ""}] ${text}`);
 	}
 }
 
@@ -223,7 +228,7 @@ async function createOfferOrchestration(ctx: ProgramContext, args: {
 			bucketId: coin.bucket_id,
 			parentIds: heads.map(hexDecode),
 			timestamp: Date.now(),
-			author: "swap-email-create",
+			author: "trade-create",
 			op: { kind: "spend", coinId: coin.coin_id },
 			blockId: randomUUID().replace(/-/g, "").slice(0, 16),
 		});
@@ -246,7 +251,7 @@ async function createOfferOrchestration(ctx: ProgramContext, args: {
 	const genesisChange = buildOfferGenesisChange({
 		offerId,
 		timestamp: Date.now(),
-		author: "swap-email-create",
+		author: "trade-create",
 		makerPubkey,
 		terms: JSON.stringify(terms),
 	});
@@ -269,7 +274,7 @@ async function createOfferOrchestration(ctx: ProgramContext, args: {
 			bucketId: offerId,
 			parentIds: [hexDecode(genesisId)],
 			timestamp: Date.now(),
-			author: "swap-email-create",
+			author: "trade-create",
 			op: {
 				kind: "offer_escrow",
 				coinId: coin.coin_id,
@@ -333,7 +338,7 @@ async function acceptOfferOrchestration(ctx: ProgramContext, args: {
 				bucketId: coin.bucket_id,
 				parentIds: heads.map(hexDecode),
 				timestamp: Date.now(),
-				author: "swap-email-accept",
+				author: "trade-accept",
 				op: { kind: "spend", coinId: coin.coin_id },
 				blockId: randomUUID().replace(/-/g, "").slice(0, 16),
 			});
@@ -352,7 +357,7 @@ async function acceptOfferOrchestration(ctx: ProgramContext, args: {
 				bucketId: args.offerId,
 				parentIds: [],
 				timestamp: Date.now(),
-				author: "swap-email-accept",
+				author: "trade-accept",
 				op: {
 					kind: "offer_pay",
 					coinId: coin.coin_id,
@@ -398,7 +403,7 @@ async function acceptOfferOrchestration(ctx: ProgramContext, args: {
 		bucketId: args.offerId,
 		parentIds: [],
 		timestamp: Date.now(),
-		author: "swap-email-accept",
+		author: "trade-accept",
 		op: {
 			kind: "offer_settle",
 			coinId: randomUUID().replace(/-/g, "").slice(0, 16),
@@ -422,7 +427,7 @@ async function acceptOfferOrchestration(ctx: ProgramContext, args: {
 			bucketId: args.offerId,
 			parentIds: [],
 			timestamp: Date.now(),
-			author: "swap-email-accept",
+			author: "trade-accept",
 			op: {
 				kind: "create",
 				coinId: out.coin_id,
@@ -483,7 +488,7 @@ async function cancelOfferOrchestration(ctx: ProgramContext, args: {
 			bucketId: args.offerId,
 			parentIds: [],
 			timestamp: Date.now(),
-			author: "swap-email-cancel",
+			author: "trade-cancel",
 			op: {
 				kind: "create",
 				coinId: randomUUID().replace(/-/g, "").slice(0, 16),
@@ -508,7 +513,7 @@ async function cancelOfferOrchestration(ctx: ProgramContext, args: {
 		bucketId: args.offerId,
 		parentIds: [],
 		timestamp: Date.now(),
-		author: "swap-email-cancel",
+		author: "trade-cancel",
 		op: {
 			kind: "offer_cancel",
 			coinId: randomUUID().replace(/-/g, "").slice(0, 16),
@@ -578,7 +583,7 @@ async function claimOfferOrchestration(ctx: ProgramContext, args: {
 			bucketId: args.offerId,
 			parentIds: [],
 			timestamp: Date.now(),
-			author: "swap-email-claim",
+			author: "trade-claim",
 			op: { kind: "spend", coinId },
 			blockId: randomUUID().replace(/-/g, "").slice(0, 16),
 		});
@@ -597,7 +602,7 @@ async function claimOfferOrchestration(ctx: ProgramContext, args: {
 			bucketId,
 			parentIds: heads.map(hexDecode),
 			timestamp: Date.now(),
-			author: "swap-email-claim",
+			author: "trade-claim",
 			op: { kind: "create", coinId: randomUUID().replace(/-/g, "").slice(0, 16), ownerPubkey: claimerPubkey, amount: out.amount, tokenId: out.tokenId },
 			blockId: randomUUID().replace(/-/g, "").slice(0, 16),
 		});
@@ -630,24 +635,20 @@ async function importOfferBundle(ctx: ProgramContext, bundleB64: string, keyName
 }
 
 async function sendEnvelope(ctx: ProgramContext, opts: {
-	recipientEmail: string;
+	recipientHyperswarmPubkey: string;
 	contentType: string;
 	payload: Uint8Array;
-	subject: string;
 	metadata?: Record<string, string>;
 }): Promise<void> {
-	const envelope = encodeTransportEnvelope({
-		contentType: opts.contentType,
-		payload: opts.payload,
-		senderPubkey: new Uint8Array(0),
-		metadata: opts.metadata ?? {},
-	});
-	const payloadB64 = Buffer.from(envelope).toString("base64");
-	await ctx.dispatchProgram("/transport-gmail", "send", [{
-		endpoint: `gmail://${opts.recipientEmail}`,
+	// transport-hyperswarm wraps payload_b64 in a TransportEnvelope itself
+	// (unlike transport-gmail which expects an already-wrapped envelope),
+	// so we pass the raw inner payload here.
+	const payloadB64 = Buffer.from(opts.payload).toString("base64");
+	await ctx.dispatchProgram("/transport-hyperswarm", "send", [{
+		endpoint: `swarm://${opts.recipientHyperswarmPubkey}`,
 		payload_b64: payloadB64,
 		content_type: opts.contentType,
-		metadata: { subject: opts.subject, ...(opts.metadata ?? {}) },
+		metadata: opts.metadata ?? {},
 	}]);
 }
 
@@ -667,16 +668,44 @@ interface StartSwapInput {
 	amountGive: string;
 	tokenWant: string;
 	amountWant: string;
-	recipientEmail: string;
+	peerId: string;            // /peer record id OR identity pubkey OR display name
 	keyName?: string;
 	timeoutSeconds?: number;
 }
 
+interface ResolvedPeer {
+	peer_id: string;
+	identity_pubkey: string;
+	hyperswarm_pubkey: string;
+	display_name: string;
+	trust_level: string;
+}
+
+/** Resolve a user-typed peer reference to a peer record with all the
+ *  fields trade needs. Looks first by record id, then by identity_pubkey
+ *  field, then by display_name. Trusted peers only. */
+async function resolvePeer(ctx: ProgramContext, ref: string): Promise<ResolvedPeer> {
+	const all = await ctx.dispatchProgram("/peer", "list", []) as Array<any>;
+	const lower = ref.toLowerCase();
+	const match = all.find((p) =>
+		p.id === ref
+		|| (p.identity_pubkey ?? "").toLowerCase() === lower
+		|| (p.display_name ?? "").toLowerCase() === lower
+	);
+	if (!match) throw new Error(`peer not found: "${ref}". Try /directory list and /directory peer first.`);
+	if (match.trust_level !== "trusted") throw new Error(`peer "${match.display_name ?? ref}" is not trusted yet. Run \`/directory peer ${match.identity_pubkey?.slice(0, 16) ?? ref}\` and wait for them to accept.`);
+	if (!match.hyperswarm_pubkey) throw new Error(`peer "${match.display_name ?? ref}" has no hyperswarm_pubkey — they may need to announce on the directory again.`);
+	return {
+		peer_id: match.id,
+		identity_pubkey: match.identity_pubkey ?? "",
+		hyperswarm_pubkey: match.hyperswarm_pubkey,
+		display_name: match.display_name ?? match.id,
+		trust_level: match.trust_level,
+	};
+}
+
 async function startSwap(ctx: ProgramContext, input: StartSwapInput): Promise<{ swap_id: string; offer_id: string }> {
-	const recipient = (input.recipientEmail || "").trim().toLowerCase();
-	if (!recipient || !recipient.includes("@")) {
-		throw new Error(`Invalid recipient email: ${input.recipientEmail}`);
-	}
+	const peer = await resolvePeer(ctx, input.peerId);
 	const keyName = input.keyName ?? "default";
 	const timeoutS = input.timeoutSeconds ?? originatorTimeoutS();
 	const swapId = generateSwapId();
@@ -698,10 +727,9 @@ async function startSwap(ctx: ProgramContext, input: StartSwapInput): Promise<{ 
 	const bundleBytes = Buffer.from(bundleB64, "base64");
 
 	await sendEnvelope(ctx, {
-		recipientEmail: recipient,
+		recipientHyperswarmPubkey: peer.hyperswarm_pubkey,
 		contentType: SWAP_OFFER_CONTENT_TYPE,
 		payload: new Uint8Array(bundleBytes),
-		subject: `swap-offer ${swapId}`,
 		metadata: {
 			swap_id: swapId,
 			maker_pubkey: makerPubkey,
@@ -713,7 +741,10 @@ async function startSwap(ctx: ProgramContext, input: StartSwapInput): Promise<{ 
 		swap_id: swapId,
 		role: "originator",
 		status: "sent",
-		counterparty_email: recipient,
+		counterparty_peer_id: peer.peer_id,
+		counterparty_identity_pubkey: peer.identity_pubkey,
+		counterparty_hyperswarm_pubkey: peer.hyperswarm_pubkey,
+		counterparty_name: peer.display_name,
 		offer_id: offerId,
 		key_name: keyName,
 		terms,
@@ -724,14 +755,14 @@ async function startSwap(ctx: ProgramContext, input: StartSwapInput): Promise<{ 
 	setSwap(ctx.state, swap);
 	await persistIfChanged(ctx.state, ctx);
 
-	await notifyUser(ctx, `Swap ${swapId} → ${recipient}: ${termsSummary(terms)}. Waiting for response (timeout ${Math.round(timeoutS / 60)} min).`);
+	await notifyUser(ctx, `Swap ${swapId} → ${peer.display_name}: ${termsSummary(terms)}. Waiting for response (timeout ${Math.round(timeoutS / 60)} min).`);
 	return { swap_id: swapId, offer_id: offerId };
 }
 
 async function handleIncomingOffer(ctx: ProgramContext, envelope: { contentType: string; payload: Uint8Array; metadata: Record<string, string> }, blobMeta: BlobMeta): Promise<boolean> {
 	const swapId = envelope.metadata?.swap_id;
 	if (!swapId) {
-		ctx.print?.(dim("[swap-email] incoming offer missing swap_id metadata"));
+		ctx.print?.(dim("[trade] incoming offer missing swap_id metadata"));
 		return false;
 	}
 	const existing = getSwap(ctx.state, swapId);
@@ -741,9 +772,30 @@ async function handleIncomingOffer(ctx: ProgramContext, envelope: { contentType:
 	}
 
 	const fromEndpoint = blobMeta.fromEndpoint ?? "";
-	const counterpartyEmail = fromEndpoint.replace(/^gmail:\/\//, "").toLowerCase();
-	if (!counterpartyEmail) {
-		ctx.print?.(dim(`[swap-email] incoming offer ${swapId} has no fromEndpoint`));
+	const senderHyperswarmPubkey = fromEndpoint.replace(/^swarm:\/\//, "").toLowerCase();
+	if (!senderHyperswarmPubkey) {
+		ctx.print?.(dim(`[trade] incoming offer ${swapId} has no fromEndpoint`));
+		return false;
+	}
+
+	// Resolve the sender via /peer. Refuse if they're not trusted — we
+	// don't accept offers from unknown peers (use /directory peer first).
+	let peer: ResolvedPeer | null = null;
+	try {
+		const all = await ctx.dispatchProgram("/peer", "list", []) as Array<any>;
+		const match = all.find((p) => (p.hyperswarm_pubkey ?? "").toLowerCase() === senderHyperswarmPubkey);
+		if (match && match.trust_level === "trusted") {
+			peer = {
+				peer_id: match.id,
+				identity_pubkey: match.identity_pubkey ?? "",
+				hyperswarm_pubkey: match.hyperswarm_pubkey,
+				display_name: match.display_name ?? match.id,
+				trust_level: match.trust_level,
+			};
+		}
+	} catch { /* fall through */ }
+	if (!peer) {
+		ctx.print?.(dim(`[trade] offer ${swapId} from untrusted swarm pubkey ${senderHyperswarmPubkey.slice(0, 12)}; ignoring`));
 		return false;
 	}
 
@@ -754,12 +806,12 @@ async function handleIncomingOffer(ctx: ProgramContext, envelope: { contentType:
 	try {
 		importResult = await importOfferBundle(ctx, bundleB64, keyName);
 	} catch (err: any) {
-		ctx.print?.(red(`[swap-email] import of incoming offer ${swapId} failed: ${err?.message ?? String(err)}`));
+		ctx.print?.(red(`[trade] import of incoming offer ${swapId} failed: ${err?.message ?? String(err)}`));
 		return false;
 	}
 
 	if (importResult.status === "missing_tokens") {
-		await notifyUser(ctx, `Incoming swap ${swapId} from ${counterpartyEmail} references tokens you don't have locally. Import token genesis bundles first. Missing: ${(importResult.missingTokens ?? []).map((t) => t.tokenId.slice(0, 8)).join(", ")}`, "high");
+		await notifyUser(ctx, `Incoming swap ${swapId} from ${peer.display_name} references tokens you don't have locally. Import token genesis bundles first. Missing: ${(importResult.missingTokens ?? []).map((t) => t.tokenId.slice(0, 8)).join(", ")}`, "high");
 		return false;
 	}
 
@@ -781,7 +833,10 @@ async function handleIncomingOffer(ctx: ProgramContext, envelope: { contentType:
 		swap_id: swapId,
 		role: "responder",
 		status: "awaiting_human",
-		counterparty_email: counterpartyEmail,
+		counterparty_peer_id: peer.peer_id,
+		counterparty_identity_pubkey: peer.identity_pubkey,
+		counterparty_hyperswarm_pubkey: peer.hyperswarm_pubkey,
+		counterparty_name: peer.display_name,
 		offer_id: importResult.offerId,
 		key_name: keyName,
 		terms,
@@ -797,12 +852,12 @@ async function handleIncomingOffer(ctx: ProgramContext, envelope: { contentType:
 	await notifyUser(
 		ctx,
 		[
-			`Incoming swap ${swapId} from ${counterpartyEmail}`,
+			`Incoming swap ${swapId} from ${peer.display_name}`,
 			`  they offer: ${terms.offered.map((t) => `${t.amount} ${t.tokenId.slice(0, 8)}`).join(" + ")}`,
 			`  they want:  ${terms.requested.map((t) => `${t.amount} ${t.tokenId.slice(0, 8)}`).join(" + ")}`,
 			``,
-			`To accept: \`/swap-email accept ${swapId}\``,
-			`To decline: \`/swap-email decline ${swapId}\``,
+			`To accept: \`/trade accept ${swapId}\``,
+			`To decline: \`/trade decline ${swapId}\``,
 			`Auto-declines in ${minutes} min if no response.`,
 		].join("\n"),
 		"high",
@@ -835,10 +890,9 @@ async function acceptSwap(ctx: ProgramContext, swapId: string): Promise<void> {
 	const bundleBytes = Buffer.from(bundleB64, "base64");
 
 	await sendEnvelope(ctx, {
-		recipientEmail: swap.counterparty_email,
+		recipientHyperswarmPubkey: swap.counterparty_hyperswarm_pubkey,
 		contentType: SWAP_RESPONSE_CONTENT_TYPE,
 		payload: new Uint8Array(bundleBytes),
-		subject: `swap-response ${swapId}`,
 		metadata: { swap_id: swapId, original_offer_id: swap.offer_id },
 	});
 
@@ -848,7 +902,7 @@ async function acceptSwap(ctx: ProgramContext, swapId: string): Promise<void> {
 		const r = await claimOfferOrchestration(ctx, { offerId: swap.offer_id, keyName: swap.key_name });
 		claimed = r.claimed;
 	} catch (err: any) {
-		ctx.print?.(yellow(`[swap-email] swap ${swapId} settled but claim failed: ${err?.message ?? String(err)}`));
+		ctx.print?.(yellow(`[trade] swap ${swapId} settled but claim failed: ${err?.message ?? String(err)}`));
 	}
 
 	swap.status = "completed";
@@ -856,7 +910,7 @@ async function acceptSwap(ctx: ProgramContext, swapId: string): Promise<void> {
 	setSwap(ctx.state, swap);
 	await persistIfChanged(ctx.state, ctx);
 
-	await notifyUser(ctx, `Swap ${swapId} completed. Claimed ${claimed} output(s); response sent to ${swap.counterparty_email}.`);
+	await notifyUser(ctx, `Swap ${swapId} completed. Claimed ${claimed} output(s); response sent to ${swap.counterparty_name}.`);
 }
 
 async function declineSwap(ctx: ProgramContext, swapId: string, reason: "explicit_decline" | "approval_timeout"): Promise<void> {
@@ -866,22 +920,16 @@ async function declineSwap(ctx: ProgramContext, swapId: string, reason: "explici
 	if (swap.status !== "awaiting_human") throw new Error(`Swap ${swapId} is in state ${swap.status}, can't decline`);
 
 	const declinePayload = JSON.stringify({ swap_id: swapId, reason });
-	const inner = encodeTransportEnvelope({
-		contentType: SWAP_DECLINE_CONTENT_TYPE,
-		payload: new TextEncoder().encode(declinePayload),
-		senderPubkey: new Uint8Array(0),
-		metadata: { swap_id: swapId, reason },
-	});
 
 	try {
-		await ctx.dispatchProgram("/transport-gmail", "send", [{
-			endpoint: `gmail://${swap.counterparty_email}`,
-			payload_b64: Buffer.from(inner).toString("base64"),
-			content_type: SWAP_DECLINE_CONTENT_TYPE,
-			metadata: { subject: `swap-decline ${swapId}`, swap_id: swapId, reason },
-		}]);
+		await sendEnvelope(ctx, {
+			recipientHyperswarmPubkey: swap.counterparty_hyperswarm_pubkey,
+			contentType: SWAP_DECLINE_CONTENT_TYPE,
+			payload: new TextEncoder().encode(declinePayload),
+			metadata: { swap_id: swapId, reason },
+		});
 	} catch (err: any) {
-		ctx.print?.(yellow(`[swap-email] decline send failed for ${swapId}: ${err?.message ?? String(err)}`));
+		ctx.print?.(yellow(`[trade] decline send failed for ${swapId}: ${err?.message ?? String(err)}`));
 	}
 
 	swap.status = "cancelled";
@@ -891,7 +939,7 @@ async function declineSwap(ctx: ProgramContext, swapId: string, reason: "explici
 
 	const userMsg = reason === "approval_timeout"
 		? `Swap ${swapId}: auto-declined after the approval window expired.`
-		: `Swap ${swapId}: declined and notified ${swap.counterparty_email}.`;
+		: `Swap ${swapId}: declined and notified ${swap.counterparty_name}.`;
 	await notifyUser(ctx, userMsg);
 }
 
@@ -909,7 +957,7 @@ async function cancelSwap(ctx: ProgramContext, swapId: string, reason: "manual" 
 		const r = await cancelOfferOrchestration(ctx, { offerId: swap.offer_id, keyName: swap.key_name });
 		returned = r.returned;
 	} catch (err: any) {
-		ctx.print?.(red(`[swap-email] cancel of ${swapId} failed: ${err?.message ?? String(err)}`));
+		ctx.print?.(red(`[trade] cancel of ${swapId} failed: ${err?.message ?? String(err)}`));
 		// Do not flip state — let next tick retry.
 		return;
 	}
@@ -918,7 +966,7 @@ async function cancelSwap(ctx: ProgramContext, swapId: string, reason: "manual" 
 	try {
 		await claimOfferOrchestration(ctx, { offerId: swap.offer_id, keyName: swap.key_name });
 	} catch (err: any) {
-		ctx.print?.(yellow(`[swap-email] coins returned but claim failed for ${swapId}: ${err?.message ?? String(err)}`));
+		ctx.print?.(yellow(`[trade] coins returned but claim failed for ${swapId}: ${err?.message ?? String(err)}`));
 	}
 
 	swap.status = reason === "timeout" ? "timed_out" : reason === "incoming_decline" ? "declined" : "cancelled";
@@ -929,7 +977,7 @@ async function cancelSwap(ctx: ProgramContext, swapId: string, reason: "manual" 
 	const userMsg = reason === "timeout"
 		? `Swap ${swapId} timed out after ${Math.round(swap.timeout_seconds / 60)} min. ${returned} coin(s) returned.`
 		: reason === "incoming_decline"
-		? `Swap ${swapId} declined by ${swap.counterparty_email}. ${returned} coin(s) returned.`
+		? `Swap ${swapId} declined by ${swap.counterparty_name}. ${returned} coin(s) returned.`
 		: `Swap ${swapId} cancelled. ${returned} coin(s) returned.`;
 	await notifyUser(ctx, userMsg);
 }
@@ -939,19 +987,19 @@ async function handleIncomingResponse(ctx: ProgramContext, envelope: { payload: 
 	if (!swapId) return false;
 	const swap = getSwap(ctx.state, swapId);
 	if (!swap) {
-		ctx.print?.(dim(`[swap-email] response for unknown swap ${swapId}, ignoring`));
+		ctx.print?.(dim(`[trade] response for unknown swap ${swapId}, ignoring`));
 		return false;
 	}
 	if (swap.role !== "originator") return false;
 	if (swap.status !== "sent") {
-		ctx.print?.(dim(`[swap-email] response for ${swapId} arrived but state is ${swap.status}, ignoring`));
+		ctx.print?.(dim(`[trade] response for ${swapId} arrived but state is ${swap.status}, ignoring`));
 		return false;
 	}
 
-	// Verify the response came from the email we sent the offer to.
-	const fromEmail = (blobMeta.fromEndpoint ?? "").replace(/^gmail:\/\//, "").toLowerCase();
-	if (fromEmail && fromEmail !== swap.counterparty_email) {
-		await notifyUser(ctx, `Swap ${swapId} got a response from unexpected email ${fromEmail} (expected ${swap.counterparty_email}); refusing to apply.`, "high");
+	// Verify the response came from the hyperswarm pubkey we sent the offer to.
+	const fromHex = (blobMeta.fromEndpoint ?? "").replace(/^swarm:\/\//, "").toLowerCase();
+	if (fromHex && fromHex !== swap.counterparty_hyperswarm_pubkey.toLowerCase()) {
+		await notifyUser(ctx, `Swap ${swapId} got a response from unexpected swarm pubkey ${fromHex.slice(0, 12)} (expected ${swap.counterparty_hyperswarm_pubkey.slice(0, 12)}); refusing to apply.`, "high");
 		return false;
 	}
 
@@ -959,7 +1007,7 @@ async function handleIncomingResponse(ctx: ProgramContext, envelope: { payload: 
 	try {
 		await importOfferBundle(ctx, bundleB64, swap.key_name);
 	} catch (err: any) {
-		ctx.print?.(red(`[swap-email] failed to import response for ${swapId}: ${err?.message ?? String(err)}`));
+		ctx.print?.(red(`[trade] failed to import response for ${swapId}: ${err?.message ?? String(err)}`));
 		return false;
 	}
 
@@ -968,7 +1016,7 @@ async function handleIncomingResponse(ctx: ProgramContext, envelope: { payload: 
 		const r = await claimOfferOrchestration(ctx, { offerId: swap.offer_id, keyName: swap.key_name });
 		claimed = r.claimed;
 	} catch (err: any) {
-		ctx.print?.(yellow(`[swap-email] settled but claim failed for ${swapId}: ${err?.message ?? String(err)}`));
+		ctx.print?.(yellow(`[trade] settled but claim failed for ${swapId}: ${err?.message ?? String(err)}`));
 	}
 
 	swap.status = "completed";
@@ -976,7 +1024,7 @@ async function handleIncomingResponse(ctx: ProgramContext, envelope: { payload: 
 	setSwap(ctx.state, swap);
 	await persistIfChanged(ctx.state, ctx);
 
-	await notifyUser(ctx, `Swap ${swapId} completed. Claimed ${claimed} output(s) from ${swap.counterparty_email}.`);
+	await notifyUser(ctx, `Swap ${swapId} completed. Claimed ${claimed} output(s) from ${swap.counterparty_name}.`);
 	return true;
 }
 
@@ -988,9 +1036,9 @@ async function handleIncomingDecline(ctx: ProgramContext, envelope: { payload: U
 	if (swap.role !== "originator") return false;
 	if (swap.status !== "sent") return false;
 
-	const fromEmail = (blobMeta.fromEndpoint ?? "").replace(/^gmail:\/\//, "").toLowerCase();
-	if (fromEmail && fromEmail !== swap.counterparty_email) {
-		ctx.print?.(dim(`[swap-email] decline for ${swapId} from unexpected sender ${fromEmail}, ignoring`));
+	const fromHex = (blobMeta.fromEndpoint ?? "").replace(/^swarm:\/\//, "").toLowerCase();
+	if (fromHex && fromHex !== swap.counterparty_hyperswarm_pubkey.toLowerCase()) {
+		ctx.print?.(dim(`[trade] decline for ${swapId} from unexpected sender ${fromHex.slice(0, 12)}, ignoring`));
 		return false;
 	}
 
@@ -1002,7 +1050,7 @@ async function handleIncomingDecline(ctx: ProgramContext, envelope: { payload: U
 
 	await cancelSwap(ctx, swapId, "incoming_decline");
 	const reasonText = reason === "approval_timeout" ? " (their human didn't respond in time)" : "";
-	await notifyUser(ctx, `Swap ${swapId} declined by ${swap.counterparty_email}${reasonText}.`);
+	await notifyUser(ctx, `Swap ${swapId} declined by ${swap.counterparty_name}${reasonText}.`);
 	return true;
 }
 
@@ -1027,7 +1075,7 @@ async function tickWatcher(ctx: ProgramContext): Promise<void> {
 				if (reportIntervalMs > 0) {
 					const lastReport = swap.last_status_report ?? swap.created_at;
 					if (now - lastReport >= reportIntervalMs) {
-						await notifyUser(ctx, `Swap ${swapId} → ${swap.counterparty_email} still pending. ${Math.round((deadline - now) / 60_000)} min until timeout.`, "low");
+						await notifyUser(ctx, `Swap ${swapId} → ${swap.counterparty_name} still pending. ${Math.round((deadline - now) / 60_000)} min until timeout.`, "low");
 						swap.last_status_report = now;
 						setSwap(state, swap);
 					}
@@ -1039,7 +1087,7 @@ async function tickWatcher(ctx: ProgramContext): Promise<void> {
 				}
 			}
 		} catch (err: any) {
-			ctx.print?.(dim(`[swap-email] tick error on ${swapId}: ${err?.message ?? String(err)}`));
+			ctx.print?.(dim(`[trade] tick error on ${swapId}: ${err?.message ?? String(err)}`));
 		}
 	}
 
@@ -1052,7 +1100,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 	const { print } = ctx;
 
 	if (cmd === "start") {
-		// swap-email start <token-give> <amount-give> for <token-want> <amount-want> with <recipient>
+		// trade start <token-give> <amount-give> for <token-want> <amount-want> with <peer>
 		const positional = args.filter((a) => !a.startsWith("--"));
 		const flags = args.filter((a) => a.startsWith("--"));
 		const keyArg = flags.find((f) => f.startsWith("--key="));
@@ -1061,22 +1109,23 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 		const timeoutSeconds = timeoutArg ? parseInt(timeoutArg.slice(10), 10) : undefined;
 
 		// Allow with-prepositions or positional-only:
-		//   start <give> <amt> <want> <want_amt> <email>
-		//   start <give> <amt> for <want> <want_amt> with <email>
+		//   start <give> <amt> <want> <want_amt> <peer>
+		//   start <give> <amt> for <want> <want_amt> with <peer>
 		const cleaned = positional.filter((p) => p !== "for" && p !== "with");
 		if (cleaned.length < 5) {
-			print(red(`Usage: /swap-email start <token-give> <amount-give> [for] <token-want> <amount-want> [with] <recipient-email> [--key=name] [--timeout=<seconds>]`));
+			print(red(`Usage: /trade start <token-give> <amount-give> [for] <token-want> <amount-want> [with] <peer> [--key=name] [--timeout=<seconds>]`));
+			print(dim(`  <peer> is a /peer record id, identity_pubkey, or display_name from /directory list.`));
 			return;
 		}
-		const [tokenGive, amountGive, tokenWant, amountWant, recipientEmail] = cleaned;
+		const [tokenGive, amountGive, tokenWant, amountWant, peerId] = cleaned;
 		try {
 			const r = await startSwap(ctx, {
 				tokenGive, amountGive, tokenWant, amountWant,
-				recipientEmail,
+				peerId,
 				keyName,
 				timeoutSeconds,
 			});
-			print(green(`Swap ${r.swap_id} sent to ${recipientEmail}`));
+			print(green(`Swap ${r.swap_id} sent to ${peerId}`));
 			print(dim(`  offer_id: ${r.offer_id}`));
 			print(dim(`  status:   sent (waiting for response)`));
 		} catch (err: any) {
@@ -1087,7 +1136,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 	if (cmd === "accept") {
 		const swapId = args[0];
-		if (!swapId) { print(red("Usage: /swap-email accept <swap-id>")); return; }
+		if (!swapId) { print(red("Usage: /trade accept <swap-id>")); return; }
 		try {
 			await acceptSwap(ctx, swapId);
 			print(green(`Swap ${swapId} accepted.`));
@@ -1099,7 +1148,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 	if (cmd === "decline") {
 		const swapId = args[0];
-		if (!swapId) { print(red("Usage: /swap-email decline <swap-id>")); return; }
+		if (!swapId) { print(red("Usage: /trade decline <swap-id>")); return; }
 		try {
 			await declineSwap(ctx, swapId, "explicit_decline");
 			print(green(`Swap ${swapId} declined.`));
@@ -1111,7 +1160,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 	if (cmd === "cancel") {
 		const swapId = args[0];
-		if (!swapId) { print(red("Usage: /swap-email cancel <swap-id>")); return; }
+		if (!swapId) { print(red("Usage: /trade cancel <swap-id>")); return; }
 		try {
 			await cancelSwap(ctx, swapId, "manual");
 			print(green(`Swap ${swapId} cancellation processed.`));
@@ -1144,7 +1193,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 		for (const id of ids) {
 			const s = swaps[id];
 			const age = Math.round((Date.now() - s.created_at) / 60_000);
-			print(`  ${cyan(id)}  ${s.role.padEnd(10)} ${s.status.padEnd(14)} ${dim(s.counterparty_email)}  ${dim(age + "m ago")}`);
+			print(`  ${cyan(id)}  ${s.role.padEnd(10)} ${s.status.padEnd(14)} ${dim(s.counterparty_name || s.counterparty_peer_id)}  ${dim(age + "m ago")}`);
 		}
 		return;
 	}
@@ -1156,23 +1205,24 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 	}
 
 	print([
-		bold("  swap-email") + dim(" — email-mediated agent-to-agent atomic swaps"),
-		`    ${cyan("/swap-email start")} ${dim("<give> <amt> for <want> <amt> with <email> [--key=name] [--timeout=<s>]")}`,
-		`    ${cyan("/swap-email accept")}  ${dim("<swap-id>")}    accept an incoming swap (responder)`,
-		`    ${cyan("/swap-email decline")} ${dim("<swap-id>")}    decline an incoming swap (responder)`,
-		`    ${cyan("/swap-email cancel")}  ${dim("<swap-id>")}    cancel an outgoing swap (originator)`,
-		`    ${cyan("/swap-email status")}  ${dim("[<swap-id>]")}  show one swap or all`,
-		`    ${cyan("/swap-email list")}                 list all swaps`,
-		`    ${cyan("/swap-email tick")}                 manually run the watcher`,
+		bold("  trade") + dim(" — agent-to-agent atomic swaps over Hyperswarm"),
+		`    ${cyan("/trade start")} ${dim("<give> <amt> for <want> <amt> with <peer> [--key=name] [--timeout=<s>]")}`,
+		`    ${cyan("/trade accept")}  ${dim("<swap-id>")}    accept an incoming swap (responder)`,
+		`    ${cyan("/trade decline")} ${dim("<swap-id>")}    decline an incoming swap (responder)`,
+		`    ${cyan("/trade cancel")}  ${dim("<swap-id>")}    cancel an outgoing swap (originator)`,
+		`    ${cyan("/trade status")}  ${dim("[<swap-id>]")}  show one swap or all`,
+		`    ${cyan("/trade list")}                 list all swaps`,
+		`    ${cyan("/trade tick")}                 manually run the watcher`,
 		"",
-		dim("    Originator timeout default 48h, receiver-approval default 20min — both env-overridable."),
+		dim("    <peer> is a TRUSTED /peer (run `/directory list` and `/directory peer <pubkey>` first)."),
+		dim("    Originator timeout default 30min, receiver-approval default 5min — both env-overridable."),
 	].join("\n"));
 };
 
 function printSwap(ctx: ProgramContext, swap: SwapState): void {
 	const { print } = ctx;
 	print(`  ${bold(swap.swap_id)}  ${swap.role}  ${swap.status}`);
-	print(dim(`    counterparty: ${swap.counterparty_email}`));
+	print(dim(`    counterparty: ${swap.counterparty_name || swap.counterparty_peer_id}`));
 	print(dim(`    offer:        ${swap.offer_id}`));
 	print(dim(`    terms:        ${termsSummary(swap.terms)}`));
 	print(dim(`    created:      ${new Date(swap.created_at).toISOString()}`));
@@ -1198,20 +1248,20 @@ const actorDef: ProgramActorDef = {
 	tickMs: WATCHER_TICK_MS,
 	onTick: async (ctx) => {
 		try { await tickWatcher(ctx); }
-		catch (err: any) { ctx.print?.(dim(`[swap-email] tick error: ${err?.message ?? String(err)}`)); }
+		catch (err: any) { ctx.print?.(dim(`[trade] tick error: ${err?.message ?? String(err)}`)); }
 	},
 	typedActions: {
 		start: {
-			description: "Start a new email-mediated swap as the originator.",
+			description: "Start a new swap as the originator (over Hyperswarm to a trusted peer).",
 			inputSchema: {
 				type: "object",
-				required: ["tokenGive", "amountGive", "tokenWant", "amountWant", "recipientEmail"],
+				required: ["tokenGive", "amountGive", "tokenWant", "amountWant", "peerId"],
 				properties: {
 					tokenGive: { type: "string" },
 					amountGive: { type: "string" },
 					tokenWant: { type: "string" },
 					amountWant: { type: "string" },
-					recipientEmail: { type: "string" },
+					peerId: { type: "string" },
 					keyName: { type: "string" },
 					timeoutSeconds: { type: "integer" },
 				},
@@ -1271,7 +1321,7 @@ const actorDef: ProgramActorDef = {
 			handler: async (ctx) => { await tickWatcher(ctx); return { ok: true }; },
 		},
 		// Content-handler entry points: invoked from the registered handlers
-		// below via /swap-email dispatch. Kept as typed actions so they're
+		// below via /trade dispatch. Kept as typed actions so they're
 		// testable without going through the router.
 		handleIncomingOffer: {
 			description: "(internal) Apply an incoming swap-offer envelope.",
@@ -1327,7 +1377,7 @@ const actorDef: ProgramActorDef = {
 	},
 };
 
-// ── Content handlers (transport-router → /swap-email actions) ────
+// ── Content handlers (transport-router → /trade actions) ────
 
 registerContentHandler(SWAP_OFFER_CONTENT_TYPE, async (envelope, ctx, blobMeta) => {
 	try {
@@ -1337,14 +1387,14 @@ registerContentHandler(SWAP_OFFER_CONTENT_TYPE, async (envelope, ctx, blobMeta) 
 			senderPubkey: envelope.senderPubkey,
 			metadata: envelope.metadata,
 		})).toString("base64");
-		const result = await ctx.dispatchProgram("/swap-email", "handleIncomingOffer", [{
+		const result = await ctx.dispatchProgram("/trade", "handleIncomingOffer", [{
 			envelope_b64: env_b64,
 			fromEndpoint: blobMeta?.fromEndpoint ?? "",
 			receivedAt: blobMeta?.receivedAt ?? Date.now(),
 		}]) as { handled: boolean };
 		return !!result?.handled;
 	} catch (err: any) {
-		ctx.print?.(dim(`[router→swap-email/offer] dispatch failed: ${err?.message ?? String(err)}`));
+		ctx.print?.(dim(`[router→trade/offer] dispatch failed: ${err?.message ?? String(err)}`));
 		return false;
 	}
 });
@@ -1357,14 +1407,14 @@ registerContentHandler(SWAP_RESPONSE_CONTENT_TYPE, async (envelope, ctx, blobMet
 			senderPubkey: envelope.senderPubkey,
 			metadata: envelope.metadata,
 		})).toString("base64");
-		const result = await ctx.dispatchProgram("/swap-email", "handleIncomingResponse", [{
+		const result = await ctx.dispatchProgram("/trade", "handleIncomingResponse", [{
 			envelope_b64: env_b64,
 			fromEndpoint: blobMeta?.fromEndpoint ?? "",
 			receivedAt: blobMeta?.receivedAt ?? Date.now(),
 		}]) as { handled: boolean };
 		return !!result?.handled;
 	} catch (err: any) {
-		ctx.print?.(dim(`[router→swap-email/response] dispatch failed: ${err?.message ?? String(err)}`));
+		ctx.print?.(dim(`[router→trade/response] dispatch failed: ${err?.message ?? String(err)}`));
 		return false;
 	}
 });
@@ -1377,14 +1427,14 @@ registerContentHandler(SWAP_DECLINE_CONTENT_TYPE, async (envelope, ctx, blobMeta
 			senderPubkey: envelope.senderPubkey,
 			metadata: envelope.metadata,
 		})).toString("base64");
-		const result = await ctx.dispatchProgram("/swap-email", "handleIncomingDecline", [{
+		const result = await ctx.dispatchProgram("/trade", "handleIncomingDecline", [{
 			envelope_b64: env_b64,
 			fromEndpoint: blobMeta?.fromEndpoint ?? "",
 			receivedAt: blobMeta?.receivedAt ?? Date.now(),
 		}]) as { handled: boolean };
 		return !!result?.handled;
 	} catch (err: any) {
-		ctx.print?.(dim(`[router→swap-email/decline] dispatch failed: ${err?.message ?? String(err)}`));
+		ctx.print?.(dim(`[router→trade/decline] dispatch failed: ${err?.message ?? String(err)}`));
 		return false;
 	}
 });

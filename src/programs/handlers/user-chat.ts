@@ -1,6 +1,6 @@
 // user-chat — generic surface for pushing messages to the human user.
 //
-// Programs like /swap-email need to alert the user ("incoming swap from
+// Programs like /trade need to alert the user ("incoming swap from
 // alice@example.com — accept?") without baking in any specific chat surface.
 // This program owns the "tell the user something" call.
 //

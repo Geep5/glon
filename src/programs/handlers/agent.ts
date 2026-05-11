@@ -15,7 +15,7 @@
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 import { dim, bold, cyan, red, green, yellow, magenta, blue } from "../shared.js";
 import type { AnthropicContent } from "./agent-llm.js";
-import { isContextOverflowError } from "./agent-llm.js";
+import { isContextOverflowError, listAvailableProviders, pickProvider } from "./agent-llm.js";
 
 import {
 	DEFAULT_MODEL,
@@ -699,6 +699,29 @@ const actorDef: ProgramActorDef = {
 		},
 		getSubagents: async (ctx: ProgramContext, agentId: string) => {
 			return await doGetSubagents(agentId, ctx);
+		},
+		/**
+		 * Survey configured LLM providers. Returns one entry per registered
+		 * provider with `available`, `envVarSet`, `authPath` ("env" | "auth.json"
+		 * | null), and the default model that would be used if we had to fall
+		 * back. Use this for status displays — astrolabe / CLI / health checks.
+		 */
+		providers: async (ctx: ProgramContext) => {
+			return await listAvailableProviders(ctx);
+		},
+		/**
+		 * Resolve which provider + model would actually serve a request for
+		 * `requestedModel`. Returns `{ provider, model, swapped, reason }`.
+		 * Does not make a network call. Throws if no provider is configured.
+		 */
+		whichProvider: async (ctx: ProgramContext, requestedModel: string) => {
+			const picked = await pickProvider(requestedModel, ctx);
+			return {
+				provider: picked.provider.name,
+				model: picked.model,
+				swapped: picked.swapped,
+				reason: picked.reason ?? null,
+			};
 		},
 	},
 };

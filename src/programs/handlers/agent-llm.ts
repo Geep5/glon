@@ -511,6 +511,136 @@ export async function callKimi(
 	};
 }
 
+// ── Provider registry ────────────────────────────────────────────
+//
+// Each provider declares how to match its models, how to check whether
+// it has credentials, a default model to fall back to, and the call fn.
+// Adding a new provider is one entry plus a `call*` implementation.
+
+type LlmCallFn = (
+	messages: { role: string; content: string | AnthropicContent[] }[],
+	system: string | undefined,
+	model: string,
+	temperature: number | undefined,
+	tools: LlmToolSpec[] | undefined,
+	onChunk: ((text: string) => void) | undefined,
+	maxTokens: number | undefined,
+	ctx: ProgramContext,
+) => Promise<InferenceResult>;
+
+export interface ProviderSpec {
+	name: string;
+	envVar: string;
+	authAction: string;
+	matchesModel: (model: string) => boolean;
+	hasCredentials: (ctx: ProgramContext | undefined) => Promise<boolean>;
+	defaultModel: () => string;
+	call: LlmCallFn;
+}
+
+const ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-20250514";
+const KIMI_DEFAULT_MODEL = "kimi-k2-0905-preview";
+
+export const PROVIDERS: ProviderSpec[] = [
+	{
+		name: "anthropic",
+		envVar: "ANTHROPIC_API_KEY",
+		authAction: "/auth login anthropic",
+		matchesModel: (m) => m.startsWith("claude-"),
+		hasCredentials: async (ctx) => !!(await resolveAnthropicCredential(ctx)),
+		defaultModel: () => process.env.ANTHROPIC_DEFAULT_MODEL ?? ANTHROPIC_DEFAULT_MODEL,
+		call: callAnthropic,
+	},
+	{
+		name: "kimi",
+		envVar: "KIMI_API_KEY",
+		authAction: "/auth login kimi <api-key>",
+		matchesModel: (m) => m.startsWith("kimi-") || m.startsWith("moonshot"),
+		hasCredentials: async (ctx) => !!(await resolveKimiCredential(ctx)),
+		defaultModel: () => process.env.KIMI_DEFAULT_MODEL ?? KIMI_DEFAULT_MODEL,
+		call: callKimi,
+	},
+];
+
+/** Provider status for diagnostics — credential presence + default model. */
+export interface ProviderStatus {
+	name: string;
+	available: boolean;
+	envVar: string;
+	envVarSet: boolean;
+	authPath: "env" | "auth.json" | null;
+	defaultModel: string;
+	authAction: string;
+}
+
+/** Survey every registered provider; tells caller which are usable.
+ *  Reports `authPath="env"` when the credential came from an env var,
+ *  `"auth.json"` when only the auth-program file has it. Env is checked
+ *  first so we don't mis-label env-only setups.
+ */
+export async function listAvailableProviders(ctx?: ProgramContext): Promise<ProviderStatus[]> {
+	const out: ProviderStatus[] = [];
+	for (const p of PROVIDERS) {
+		const envVarSet = !!process.env[p.envVar];
+		let authPath: ProviderStatus["authPath"] = null;
+		let available = false;
+		if (envVarSet) { authPath = "env"; available = true; }
+		if (!available && ctx) {
+			try {
+				const fromAuth = await ctx.dispatchProgram("/auth", p.name === "anthropic" ? "getAnthropic" : "getKimi", []) as { token?: string } | null;
+				if (fromAuth?.token) { authPath = "auth.json"; available = true; }
+			} catch { /* /auth not loaded */ }
+		}
+		out.push({
+			name: p.name,
+			available,
+			envVar: p.envVar,
+			envVarSet,
+			authPath,
+			defaultModel: p.defaultModel(),
+			authAction: p.authAction,
+		});
+	}
+	return out;
+}
+
+/** Result of resolving which provider should serve a given model request. */
+export interface PickedProvider {
+	provider: ProviderSpec;
+	model: string;
+	swapped: boolean;
+	reason?: string;
+}
+
+/**
+ * Pick the provider that will actually handle a request. If the model's
+ * "native" provider has credentials, use it. Otherwise, fall back to the
+ * first provider with credentials, using its default model. Throws if
+ * nothing is configured.
+ *
+ * Exported so tests and the /agent.providers action can inspect the
+ * decision without making a request.
+ */
+export async function pickProvider(requestedModel: string, ctx: ProgramContext | undefined): Promise<PickedProvider> {
+	const intended = PROVIDERS.find((p) => p.matchesModel(requestedModel));
+	if (intended && await intended.hasCredentials(ctx)) {
+		return { provider: intended, model: requestedModel, swapped: false };
+	}
+	for (const p of PROVIDERS) {
+		if (p === intended) continue;
+		if (await p.hasCredentials(ctx)) {
+			const reason = intended
+				? `requested ${requestedModel} (${intended.name}) but no ${intended.envVar} or auth.json entry; using ${p.name}`
+				: `unknown model ${requestedModel}; falling back to first configured provider (${p.name})`;
+			return { provider: p, model: p.defaultModel(), swapped: true, reason };
+		}
+	}
+	const tried = PROVIDERS.map((p) => `${p.envVar} or \`${p.authAction}\``).join(" / ");
+	throw new Error(
+		`No LLM credentials configured for any provider. Set one of: ${tried}.`,
+	);
+}
+
 // ── Unified LLM dispatcher ───────────────────────────────────────
 
 export async function callLLM(
@@ -530,10 +660,12 @@ export async function callLLM(
 	if (testFetch) {
 		return testFetch({ messages, tools, system, model, maxTokens });
 	}
-	if (model.startsWith("moonshot") || model.startsWith("kimi-")) {
-		return callKimi(messages, system, model, temperature, tools, onChunk, maxTokens, ctx);
+
+	const picked = await pickProvider(model, ctx);
+	if (picked.swapped && picked.reason) {
+		ctx?.print?.(`[agent-llm] ${picked.reason}`);
 	}
-	return callAnthropic(messages, system, model, temperature, tools, onChunk, maxTokens, ctx);
+	return picked.provider.call(messages, system, picked.model, temperature, tools, onChunk, maxTokens, ctx);
 }
 
 // ── Error classification ─────────────────────────────────────────

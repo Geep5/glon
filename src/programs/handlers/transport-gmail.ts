@@ -67,15 +67,15 @@ async function getAccessToken(): Promise<string> {
 	const inj = (globalThis as any).__GMAIL_TOKEN_FN as undefined | (() => Promise<string>);
 	if (inj) return await inj();
 	return await new Promise<string>((resolve, reject) => {
-		execFile("gcloud", ["auth", "print-access-token"], { timeout: 15_000 }, (err, stdout, stderr) => {
+		execFile("gcloud", ["auth", "application-default", "print-access-token"], { timeout: 15_000 }, (err, stdout, stderr) => {
 			if (err) {
-				const hint = "transport-gmail requires the local gcloud CLI authenticated. Run: gcloud auth login --enable-gdrive-access (and ensure Gmail scope is granted).";
+				const hint = "transport-gmail requires gcloud ADC with Gmail scope. Run: gcloud auth application-default login --scopes=openid,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/gmail.modify";
 				reject(new Error(`${hint}\nUnderlying: ${stderr?.trim() || err.message}`));
 				return;
 			}
 			const tok = stdout.trim();
 			if (!tok) {
-				reject(new Error("transport-gmail: gcloud returned empty token. Re-run `gcloud auth login`."));
+				reject(new Error("transport-gmail: gcloud returned empty ADC token. Re-run `gcloud auth application-default login --scopes=...gmail.modify`."));
 				return;
 			}
 			resolve(tok);

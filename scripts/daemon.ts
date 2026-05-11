@@ -87,6 +87,38 @@ async function resolveId(raw: string): Promise<string | null> {
 	async function main() {
 		const DEV = process.argv.includes("--dev");
 		console.log(`[daemon] connecting to ${ENDPOINT}${DEV ? " (dev mode)" : ""}`);
+
+		// ── Hyperswarm bring-up (Phase 1 — transport-hyperswarm) ──
+		// Bring the swarm online before any program actor starts so the
+		// /directory program can call joinTopic() in its onCreate.
+		// Disabled by default for the v0 cohort that doesn't yet have peers
+		// configured; opt-in via GLON_SWARM=1 until everyone is ready.
+		if (process.env.GLON_SWARM === "1") {
+			try {
+				const { default: Hyperswarm } = await import("hyperswarm");
+				const { initSwarm, loadOrCreateKeyPair } = await import("../src/swarm-host.js");
+				const { decodeTransportEnvelope } = await import("../src/proto.js");
+				const keyPair = loadOrCreateKeyPair(() => {
+					const tmp = new Hyperswarm();
+					const kp = tmp.keyPair;
+					// Destroy the throwaway so it doesn't hold a DHT socket.
+					tmp.destroy().catch(() => {});
+					return kp;
+				});
+				const swarm = new Hyperswarm({ keyPair });
+				initSwarm({
+					swarm: swarm as any,
+					decodeEnvelope: (bytes) => {
+						const env = decodeTransportEnvelope(bytes);
+						return { contentType: env.contentType, metadata: env.metadata ?? {} };
+					},
+				});
+				console.log(`[daemon] swarm online — hyperswarm pubkey: ${keyPair.publicKey.toString("hex").slice(0, 16)}...`);
+			} catch (err: any) {
+				console.log(`[daemon] swarm bring-up failed: ${err?.message ?? err} (continuing without swarm)`);
+			}
+		}
+
 		let programs: ProgramEntry[] = await loadPrograms(store, client);
 		console.log(`[daemon] loaded ${programs.length} programs`);
 

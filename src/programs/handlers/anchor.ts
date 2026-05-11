@@ -74,13 +74,50 @@ interface VDFProof {
 interface PersistedState {
 	lastAnchorId: string;
 	lastAnchorHeight: number;
+	miningDisabled: boolean;
 }
 
 function loadState(raw: Record<string, unknown>): PersistedState {
 	return {
 		lastAnchorId: typeof raw.lastAnchorId === "string" ? raw.lastAnchorId : "",
 		lastAnchorHeight: typeof raw.lastAnchorHeight === "number" ? raw.lastAnchorHeight : -1,
+		miningDisabled: typeof raw.miningDisabled === "boolean" ? raw.miningDisabled : false,
 	};
+}
+
+// ── Mining toggle (runtime + env-driven) ─────────────────────────
+//
+// The `/anchor` actor ticks every 60s and mints a FIG reward by default
+// just for being loaded. That is rarely what a single-machine user wants.
+// The toggle is stored two ways:
+//   - env var GLON_ANCHOR_DISABLED=1 → default-off at boot
+//   - field `mining_disabled` on the /anchor program object →
+//     persists across restarts, set/cleared by `setEnabled` action
+// On startup `restoreMiningDisabled` resolves the field first (if present)
+// and falls back to the env var. `onTick` no-ops while disabled.
+
+const MINING_DISABLED_FIELD = "mining_disabled";
+
+async function restoreMiningDisabled(ctx: ProgramContext): Promise<boolean> {
+	if (!ctx.programId) return process.env.GLON_ANCHOR_DISABLED === "1";
+	try {
+		const obj = await (ctx.store as any).get(ctx.programId);
+		const f = obj?.fields?.[MINING_DISABLED_FIELD];
+		if (f && typeof f === "object" && "boolValue" in f) return !!f.boolValue;
+		if (typeof f === "boolean") return f;
+	} catch { /* ignore */ }
+	return process.env.GLON_ANCHOR_DISABLED === "1";
+}
+
+async function persistMiningDisabled(ctx: ProgramContext, disabled: boolean): Promise<void> {
+	if (!ctx.programId) return;
+	try {
+		const actor = ctx.objectActor(ctx.programId) as any;
+		if (typeof actor?.setField !== "function") return;
+		await actor.setField(MINING_DISABLED_FIELD, JSON.stringify(ctx.boolVal(disabled)));
+	} catch (err: any) {
+		ctx.print?.(dim(`  [anchor] persist mining_disabled failed: ${err?.message ?? String(err)}`));
+	}
 }
 
 // ── Reward calculation ───────────────────────────────────────────
@@ -505,9 +542,51 @@ const actorDef: ProgramActorDef = {
 	createState: (): Record<string, unknown> => ({
 		lastAnchorId: "",
 		lastAnchorHeight: -1,
+		miningDisabled: false,
 	}),
 
+	onCreate: async (ctx: ProgramContext) => {
+		const disabled = await restoreMiningDisabled(ctx);
+		ctx.state!.miningDisabled = disabled;
+		if (disabled) {
+			ctx.print?.(dim(`  [anchor] mining DISABLED — onTick will no-op until /anchor setEnabled true`));
+		}
+	},
+
 	actions: {
+		/** Enable or disable the auto-mining tick. Idempotent; persists to the
+		 *  program object so the choice survives daemon restarts. */
+		setEnabled: async (ctx: ProgramContext, opts: boolean | string | { enabled?: boolean }) => {
+			let enabled: boolean;
+			if (typeof opts === "boolean") enabled = opts;
+			else if (typeof opts === "string") {
+				try { enabled = !!(JSON.parse(opts) as { enabled?: boolean }).enabled; }
+				catch { enabled = opts === "true"; }
+			} else enabled = !!opts?.enabled;
+			const disabled = !enabled;
+			ctx.state!.miningDisabled = disabled;
+			await persistMiningDisabled(ctx, disabled);
+			return {
+				enabled,
+				mining_disabled: disabled,
+				tick_ms: AUTO_ANCHOR_MS,
+			};
+		},
+
+		/** Read the current toggle state plus the latest mined anchor. */
+		getStatus: async (ctx: ProgramContext) => {
+			return {
+				enabled: !ctx.state?.miningDisabled,
+				mining_disabled: !!ctx.state?.miningDisabled,
+				env_default_disabled: process.env.GLON_ANCHOR_DISABLED === "1",
+				tick_ms: AUTO_ANCHOR_MS,
+				last_anchor_id: (ctx.state?.lastAnchorId as string) ?? "",
+				last_anchor_height: (ctx.state?.lastAnchorHeight as number) ?? -1,
+				reward_symbol: REWARD_SYMBOL,
+				next_reward_units: computeReward(((ctx.state?.lastAnchorHeight as number) ?? -1) + 1),
+			};
+		},
+
 		createAnchor: async (ctx: ProgramContext, opts?: {
 			vdfProof?: VDFProof;
 			plotProof?: string;
@@ -577,6 +656,8 @@ const actorDef: ProgramActorDef = {
 	},
 
 	onTick: async (ctx: ProgramContext) => {
+		// Skip mining if disabled by setEnabled or the GLON_ANCHOR_DISABLED env.
+		if (ctx.state?.miningDisabled) return;
 		const store = ctx.store as any;
 		const latest = await findLatestAnchor(store);
 		const height = latest ? latest.height + 1 : 0;
