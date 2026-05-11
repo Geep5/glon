@@ -664,7 +664,30 @@ const actorDef: ProgramActorDef = {
 		},
 		acceptRequest: { description: "Accept an incoming peer request.", inputSchema: { type: "object", required: ["request_id"], properties: { request_id: { type: "string" } } }, handler: async (ctx, input: { request_id: string }) => acceptRequest(ctx, input.request_id) },
 		declineRequest: { description: "Decline an incoming peer request.", inputSchema: { type: "object", required: ["request_id"], properties: { request_id: { type: "string" }, reason: { type: "string" } } }, handler: async (ctx, input: { request_id: string; reason?: "declined" | "approval_timeout" }) => declineRequest(ctx, input.request_id, input.reason ?? "declined") },
-		status: { description: "Network state snapshot.", inputSchema: { type: "object", properties: {} }, handler: async (ctx) => ({ ...statusSnapshot(), pending_requests: Object.values(ctx.state.requests ?? {}).filter((r: any) => r.status === "waiting").length, discovered_count: Object.keys(ctx.state.discovered ?? {}).length }) },
+		status: {
+			description: "Network state snapshot, including a `self` block so UIs can show 'you'.",
+			inputSchema: { type: "object", properties: {} },
+			handler: async (ctx) => {
+				const snap = statusSnapshot();
+				const { identity_pubkey, agent_name } = await resolveSelfIdentity(ctx);
+				const lastAnnounceAt = (ctx.state._lastAnnounceAt as number) ?? 0;
+				const announceIntervalMs = announceIntervalS() * 1000;
+				const isAnnouncing = swarmIsReady() && (Date.now() - lastAnnounceAt) < announceIntervalMs * 2;
+				return {
+					...snap,
+					pending_requests: Object.values(ctx.state.requests ?? {}).filter((r: any) => r.status === "waiting").length,
+					discovered_count: Object.keys(ctx.state.discovered ?? {}).length,
+					self: {
+						identity_pubkey,
+						hyperswarm_pubkey: snap.hyperswarm_pubkey,
+						agent_name,
+						last_announce_at: lastAnnounceAt,
+						is_announcing: isAnnouncing,
+						announce_interval_s: announceIntervalS(),
+					},
+				};
+			},
+		},
 		tick: { description: "Force the watcher tick.", inputSchema: { type: "object", properties: {} }, handler: async (ctx) => { await doTick(ctx); return { ok: true }; } },
 	},
 };

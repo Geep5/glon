@@ -730,8 +730,14 @@ export async function dispatchActorAction(
 	// Prefer typedActions over legacy actions.
 	const typed = instance.def.typedActions?.[action];
 	if (typed) {
-		// typedActions receive a single input object as args[0].
-		const input = args[0];
+		// typedActions receive a single input object as args[0]. Coerce
+		// undefined → {} when the schema expects an object so no-arg
+		// actions (status, list, tick, …) work without callers having
+		// to pass a placeholder `[{}]`.
+		let input = args[0];
+		if (input === undefined && (typed.inputSchema as { type?: string } | undefined)?.type === "object") {
+			input = {};
+		}
 		if (typed.inputSchema) {
 			const err = validateSchema(input, typed.inputSchema);
 			if (err) throw new Error(`Schema validation failed for action "${action}": ${err}`);
