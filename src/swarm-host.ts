@@ -125,13 +125,22 @@ export function getHyperswarmPublicKeyHex(): string {
 	return require_().swarm.keyPair.publicKey.toString("hex");
 }
 
-/** Join a topic. Idempotent. Returns when discovery has flushed once. */
+/** Join a topic. Idempotent. Returns when discovery has flushed once.
+ *
+ *  Retro-tags every already-open connection with this topic so that a
+ *  subsequent broadcastOnTopic reaches them too. Without this, peers
+ *  whose conn-event fired BEFORE we joined the topic would be silently
+ *  skipped by broadcasts forever (Hyperswarm doesn't tell us which
+ *  topic each connection actually came from, so we treat every shared
+ *  topic as a candidate route). */
 export async function joinTopic(topic: Buffer): Promise<void> {
 	const s = require_();
 	const key = topic.toString("hex");
 	if (s.joinedTopics.has(key)) return;
 	const disco = s.swarm.join(topic, { server: true, client: true });
 	s.joinedTopics.set(key, disco);
+	// Retro-tag any pre-existing connections.
+	for (const topics of s.connTopics.values()) topics.add(key);
 	await disco.flushed();
 }
 
