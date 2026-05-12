@@ -735,6 +735,41 @@ const actorDef: ProgramActorDef = {
 				return await handleAnnounce(ctx, envelope, blobMeta);
 			},
 		},
+		// The three handlers below MUST be dispatched through /directory's
+		// actor (not invoked directly from /transport-router's ctx) so the
+		// state mutation lands in /directory's state and persistIfChanged
+		// writes to /directory's persisted field. Same trick as
+		// handleAnnounce above — keep them parallel.
+		handlePeerRequest: {
+			description: "Process an incoming peer-request envelope.",
+			inputSchema: { type: "object", required: ["envelope_b64"], properties: { envelope_b64: { type: "string" }, content_type: { type: "string" }, from: { type: "string" } } },
+			handler: async (ctx, input: any) => {
+				const payload = Buffer.from(input.envelope_b64, "base64");
+				const envelope = { payload, metadata: {} };
+				const blobMeta = { fromEndpoint: input.from };
+				return await handlePeerRequest(ctx, envelope, blobMeta);
+			},
+		},
+		handlePeerAccept: {
+			description: "Process an incoming peer-accept envelope.",
+			inputSchema: { type: "object", required: ["envelope_b64"], properties: { envelope_b64: { type: "string" }, content_type: { type: "string" }, from: { type: "string" } } },
+			handler: async (ctx, input: any) => {
+				const payload = Buffer.from(input.envelope_b64, "base64");
+				const envelope = { payload, metadata: {} };
+				const blobMeta = { fromEndpoint: input.from };
+				return await handlePeerAccept(ctx, envelope, blobMeta);
+			},
+		},
+		handlePeerDecline: {
+			description: "Process an incoming peer-decline envelope.",
+			inputSchema: { type: "object", required: ["envelope_b64"], properties: { envelope_b64: { type: "string" }, content_type: { type: "string" }, from: { type: "string" } } },
+			handler: async (ctx, input: any) => {
+				const payload = Buffer.from(input.envelope_b64, "base64");
+				const envelope = { payload, metadata: {} };
+				const blobMeta = { fromEndpoint: input.from };
+				return await handlePeerDecline(ctx, envelope, blobMeta);
+			},
+		},
 	},
 };
 
@@ -744,14 +779,21 @@ registerContentHandler(PEER_ANNOUNCE_CONTENT_TYPE, async (envelope, ctx, blobMet
 	try { return await ctx.dispatchProgram("/directory", "handleAnnounce", [{ envelope_b64: Buffer.from(envelope.payload).toString("base64"), content_type: envelope.contentType, from: blobMeta?.fromEndpoint }]) as any; }
 	catch { return await handleAnnounce(ctx, envelope, blobMeta ?? {}); }
 });
+// All four content handlers route through /directory's actor via
+// dispatchProgram so the mutations land on /directory's state (not
+// the calling /transport-router's). Direct in-process invocation is a
+// last-resort fallback if the actor isn't running.
 registerContentHandler(PEER_REQUEST_CONTENT_TYPE, async (envelope, ctx, blobMeta) => {
-	return await handlePeerRequest(ctx, envelope, blobMeta ?? {});
+	try { return await ctx.dispatchProgram("/directory", "handlePeerRequest", [{ envelope_b64: Buffer.from(envelope.payload).toString("base64"), content_type: envelope.contentType, from: blobMeta?.fromEndpoint }]) as any; }
+	catch { return await handlePeerRequest(ctx, envelope, blobMeta ?? {}); }
 });
 registerContentHandler(PEER_ACCEPT_CONTENT_TYPE, async (envelope, ctx, blobMeta) => {
-	return await handlePeerAccept(ctx, envelope, blobMeta ?? {});
+	try { return await ctx.dispatchProgram("/directory", "handlePeerAccept", [{ envelope_b64: Buffer.from(envelope.payload).toString("base64"), content_type: envelope.contentType, from: blobMeta?.fromEndpoint }]) as any; }
+	catch { return await handlePeerAccept(ctx, envelope, blobMeta ?? {}); }
 });
 registerContentHandler(PEER_DECLINE_CONTENT_TYPE, async (envelope, ctx, blobMeta) => {
-	return await handlePeerDecline(ctx, envelope, blobMeta ?? {});
+	try { return await ctx.dispatchProgram("/directory", "handlePeerDecline", [{ envelope_b64: Buffer.from(envelope.payload).toString("base64"), content_type: envelope.contentType, from: blobMeta?.fromEndpoint }]) as any; }
+	catch { return await handlePeerDecline(ctx, envelope, blobMeta ?? {}); }
 });
 
 const program: ProgramDef = { handler, actor: actorDef };
