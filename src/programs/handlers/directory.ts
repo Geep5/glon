@@ -57,6 +57,7 @@ export interface DiscoveredPeer {
 	first_seen: number;
 	last_seen: number;
 	peer_object_id?: string;       // local /peer record id, populated on upsert
+	agents?: Array<{ id: string; name: string }>;  // from PeerAnnounceBody.agents
 }
 
 export type RequestStatus = "waiting" | "accepted" | "declined" | "timed_out";
@@ -217,6 +218,13 @@ async function upsertPeer(ctx: ProgramContext, opts: {
  *     of the migration. NEVER reuse an old field name with new semantics.
  */
 const ANNOUNCE_PROTOCOL_VERSION = 1;
+
+/** Lightweight agent roster entry — one per /agent object the sender hosts. */
+export interface AnnouncedAgent {
+	id: string;
+	name: string;
+}
+
 interface PeerAnnounceBody {
 	protocol_version?: number;          // optional only for back-compat reads of pre-v1 announces.
 	identity_pubkey: string;
@@ -224,43 +232,41 @@ interface PeerAnnounceBody {
 	agent_name: string;
 	capabilities: string[];
 	announced_at: number;
+	// New in this protocol_version (still v1 — additive). Pre-v1 receivers
+	// just ignore it. The roster lets remote UIs render specific agents
+	// orbiting the peer's sun and address chat envelopes to individual
+	// agents (once from_subentity_id / to_subentity_id are wired into
+	// peer-chat envelopes).
+	agents?: AnnouncedAgent[];
 }
 
-async function resolveSelfIdentity(ctx: ProgramContext): Promise<{ identity_pubkey: string; agent_name: string }> {
-	// Wallet's default key is treated as this daemon's chain identity. If
-	// there is no default key yet the announce is informational only —
-	// we still publish hyperswarm_pubkey so others can find us.
+async function resolveSelfIdentity(ctx: ProgramContext): Promise<{ identity_pubkey: string; agent_name: string; agents: AnnouncedAgent[] }> {
+	// Wallet's default key is treated as this daemon's chain identity.
 	let identity_pubkey = "";
 	try {
 		const info = await ctx.dispatchProgram("/wallet", "show", ["default"]) as { pubkey?: string } | null;
 		identity_pubkey = info?.pubkey ?? "";
 	} catch { /* no wallet, no key */ }
-	// Glon's "agent_name" on the wire is the human-meaningful label other
-	// peers see in their Network panel. We name it after this daemon's
-	// FIRST agent (id-sorted, oldest UUIDv4 first — deterministic across
-	// restarts as long as the agent isn't deleted). Previous code called
-	// "/agent list" which doesn't exist, silently caught the error, and
-	// fell back to the hardcoded "glon" — which is why every glon on the
-	// network looked identical.
-	//
-	// Falls back to "glon" only if there are literally no agent objects in
-	// the DAG yet. UIs append a short identity_pubkey hash anyway so two
-	// peers with the same agent name remain distinguishable.
+	// Walk the DAG's agent objects once: gives us both the "first agent"
+	// for the legacy agent_name field AND the full roster for the new
+	// `agents` array on the announce body.
 	let agent_name = "glon";
+	const agents: AnnouncedAgent[] = [];
 	try {
 		const result = await ctx.dispatchProgram("/crud", "list", ["agent"]) as { objects?: Array<{ id: string; typeKey?: string; name?: string; deleted?: boolean }> } | null;
-		const agents = (result?.objects ?? [])
+		const liveAgents = (result?.objects ?? [])
 			.filter((o) => o?.typeKey === "agent" && !o.deleted && typeof o.name === "string" && o.name.length > 0)
 			.sort((a, b) => String(a.id).localeCompare(String(b.id)));
-		if (agents.length > 0 && agents[0].name) agent_name = agents[0].name as string;
+		for (const a of liveAgents) agents.push({ id: a.id, name: a.name as string });
+		if (agents.length > 0) agent_name = agents[0].name;
 	} catch { /* no /crud, or empty DAG — keep fallback */ }
-	return { identity_pubkey, agent_name };
+	return { identity_pubkey, agent_name, agents };
 }
 
 async function broadcastAnnounce(ctx: ProgramContext): Promise<{ sent: number; skipped: number } | null> {
 	if (!swarmIsReady()) return null;
 	const hyperswarm_pubkey = getHyperswarmPublicKeyHex();
-	const { identity_pubkey, agent_name } = await resolveSelfIdentity(ctx);
+	const { identity_pubkey, agent_name, agents } = await resolveSelfIdentity(ctx);
 	const body: PeerAnnounceBody = {
 		protocol_version: ANNOUNCE_PROTOCOL_VERSION,
 		identity_pubkey,
@@ -268,6 +274,7 @@ async function broadcastAnnounce(ctx: ProgramContext): Promise<{ sent: number; s
 		agent_name,
 		capabilities: ["trade", "swap"],
 		announced_at: Date.now(),
+		agents,                            // remote glons render these as orbiters of this peer's sun
 	};
 	const payload_b64 = Buffer.from(JSON.stringify(body)).toString("base64");
 	const topicHex = directoryTopic().toString("hex");
@@ -317,6 +324,12 @@ async function handleAnnounce(ctx: ProgramContext, envelope: { payload: Uint8Arr
 		first_seen: existing?.first_seen ?? Date.now(),
 		last_seen: Date.now(),
 		peer_object_id: existing?.peer_object_id,
+		agents: Array.isArray(body.agents)
+			? body.agents
+				.filter((a) => a && typeof a.id === "string" && typeof a.name === "string")
+				.slice(0, 32)
+				.map((a) => ({ id: a.id, name: a.name }))
+			: existing?.agents,        // preserve prior roster if this announce has none (pre-v1 sender)
 	};
 	state.discovered[idKey] = merged;
 
@@ -331,6 +344,21 @@ async function handleAnnounce(ctx: ProgramContext, envelope: { payload: Uint8Arr
 			existing_peer_object_id: merged.peer_object_id,
 		});
 		if (peerId) merged.peer_object_id = peerId;
+		// Cache the peer's agent roster on their /peer record as a JSON
+		// blob. Lets UIs render specific remote agents and address chats
+		// to them. Forward-compat with pre-roster peers: missing/empty
+		// stays missing/empty.
+		if (peerId && Array.isArray(body.agents)) {
+			try {
+				const rosterJson = JSON.stringify(
+					body.agents
+						.filter((a) => a && typeof a.id === "string" && typeof a.name === "string")
+						.slice(0, 32)            // cap at 32 to bound the field size
+						.map((a) => ({ id: a.id, name: a.name })),
+				);
+				await ctx.dispatchProgram("/peer", "setField", [peerId, "agents_json", rosterJson]);
+			} catch { /* peer field not whitelisted yet, or transient — non-fatal */ }
+		}
 	}
 	await persistIfChanged(state, ctx);
 	return true;

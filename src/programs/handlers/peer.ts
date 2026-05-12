@@ -67,7 +67,10 @@ export function isPeered(trust_level: string | undefined | null): boolean {
 //                       May rotate; rewritten on every upsertPeer.
 //   last_seen          — wall-clock ms of last announce/handshake. Used by
 //                       UIs and the trade orchestrator to pick a fresh peer.
-	const PEER_FIELDS = ["display_name", "kind", "trust_level", "identity_pubkey", "hyperswarm_pubkey", "endpoints", "preferred_transport", "key_verified_at", "attestations", "discord_id", "email", "notes", "last_seen"] as const;
+//   agents_json — JSON-encoded array of {id, name} from the peer's most
+//                 recent announce. Lets UIs render that peer's specific
+//                 agents and (later) address messages to them by id.
+	const PEER_FIELDS = ["display_name", "kind", "trust_level", "identity_pubkey", "hyperswarm_pubkey", "endpoints", "preferred_transport", "key_verified_at", "attestations", "discord_id", "email", "notes", "last_seen", "agents_json"] as const;
 
 // ── Helpers ──────────────────────────────────────────────────────
 
