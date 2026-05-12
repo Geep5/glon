@@ -417,17 +417,30 @@ async function handlePeerRequest(ctx: ProgramContext, envelope: { payload: Uint8
 	return true;
 }
 
-async function handlePeerAccept(ctx: ProgramContext, envelope: { payload: Uint8Array; metadata: Record<string, string> }, blob: BlobMeta) {
+	async function handlePeerAccept(ctx: ProgramContext, envelope: { payload: Uint8Array; metadata: Record<string, string> }, blob: BlobMeta) {
 	let body: { request_id: string; identity_pubkey: string; hyperswarm_pubkey: string };
 	try { body = JSON.parse(new TextDecoder().decode(envelope.payload)); }
 	catch { return false; }
 
 	const state = ctx.state;
 	const req = (state.requests as Record<string, PendingRequest> | undefined)?.[body.request_id];
-	if (!req || req.direction !== "outgoing" || req.status !== "waiting") return false;
+	if (!req || req.direction !== "outgoing") {
+		ctx.print?.(dim(`[directory] handlePeerAccept: unknown request ${body.request_id.slice(0, 8)}`));
+		return false;
+	}
+	if (req.status === "declined") {
+		ctx.print?.(dim(`[directory] handlePeerAccept: request ${body.request_id.slice(0, 8)} already declined, ignoring accept`));
+		return false;
+	}
 
 	const fromHex = (blob.fromEndpoint ?? "").replace(/^swarm:\/\//, "").toLowerCase();
-	if (fromHex && fromHex !== req.peer_hyperswarm_pubkey.toLowerCase()) return false;
+	if (fromHex && fromHex !== req.peer_hyperswarm_pubkey.toLowerCase()) {
+		ctx.print?.(dim(`[directory] handlePeerAccept: sender ${fromHex.slice(0, 12)} doesn't match expected ${req.peer_hyperswarm_pubkey.slice(0, 12)}`));
+		return false;
+	}
+
+	// Idempotent: already accepted — just return true.
+	if (req.status === "accepted") return true;
 
 	req.status = "accepted";
 	state.requests[req.request_id] = req;
@@ -445,7 +458,7 @@ async function handlePeerAccept(ctx: ProgramContext, envelope: { payload: Uint8A
 	await persistIfChanged(state, ctx);
 	await notifyUser(ctx, `${req.peer_agent_name} accepted your peer request. You can now trade.`);
 	return true;
-}
+	}
 
 async function handlePeerDecline(ctx: ProgramContext, envelope: { payload: Uint8Array; metadata: Record<string, string> }, blob: BlobMeta) {
 	let body: { request_id: string; reason?: "declined" | "approval_timeout" };
