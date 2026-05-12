@@ -17,10 +17,12 @@
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 import { registerActorContentHandler } from "../runtime.js";
-import { dim, bold, cyan, green, red, yellow } from "../shared.js";
-import { isPeered } from "./peer.js";
 import { randomUUID } from "node:crypto";
 
+const PEER_TRUSTED_LEVELS = new Set(["trusted", "friend", "family", "self"]);
+function isPeered(trust_level: string | undefined | null): boolean {
+	return !!trust_level && PEER_TRUSTED_LEVELS.has(trust_level);
+}
 // ── Constants ────────────────────────────────────────────────────
 
 export const PEER_CHAT_CONTENT_TYPE = "glon/peer-chat";
