@@ -31,6 +31,7 @@ import { dim, bold, cyan, red, green, yellow, magenta } from "../shared.js";
 		kind: string;
 		trust_level: string;
 		identity_pubkey?: string;
+		hyperswarm_pubkey?: string;
 		endpoints?: string;
 		preferred_transport?: string;
 		key_verified_at?: string;
@@ -38,11 +39,16 @@ import { dim, bold, cyan, red, green, yellow, magenta } from "../shared.js";
 		discord_id?: string;
 		email?: string;
 		notes?: string;
+		last_seen?: string;
 	}
 
 // Recognised field keys for peer objects. Any other field is ignored by
 // the read path but preserved on disk.
-	const PEER_FIELDS = ["display_name", "kind", "trust_level", "identity_pubkey", "endpoints", "preferred_transport", "key_verified_at", "attestations", "discord_id", "email", "notes"] as const;
+//   hyperswarm_pubkey — current Noise pubkey learned via /directory announce.
+//                       May rotate; rewritten on every upsertPeer.
+//   last_seen          — wall-clock ms of last announce/handshake. Used by
+//                       UIs and the trade orchestrator to pick a fresh peer.
+	const PEER_FIELDS = ["display_name", "kind", "trust_level", "identity_pubkey", "hyperswarm_pubkey", "endpoints", "preferred_transport", "key_verified_at", "attestations", "discord_id", "email", "notes", "last_seen"] as const;
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -60,6 +66,7 @@ function extractString(v: any): string | undefined {
 			kind: extractString(fields?.kind) ?? "human",
 			trust_level: extractString(fields?.trust_level) ?? "stranger",
 			identity_pubkey: extractString(fields?.identity_pubkey),
+			hyperswarm_pubkey: extractString(fields?.hyperswarm_pubkey),
 			endpoints: extractString(fields?.endpoints),
 			preferred_transport: extractString(fields?.preferred_transport),
 			key_verified_at: extractString(fields?.key_verified_at),
@@ -67,6 +74,7 @@ function extractString(v: any): string | undefined {
 			discord_id: extractString(fields?.discord_id),
 			email: extractString(fields?.email),
 			notes: extractString(fields?.notes),
+			last_seen: extractString(fields?.last_seen),
 		};
 	}
 
