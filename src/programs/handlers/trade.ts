@@ -298,6 +298,10 @@ async function createOfferOrchestration(ctx: ProgramContext, args: {
 
 	const storeActor = (client as any).storeActor.getOrCreate(["root"]);
 	await storeActor.pushChangesBatch(JSON.stringify(batchEntries));
+	// Per-transaction anchoring: trigger /anchor's dirty check so the
+	// fresh bucket/offer state is captured immediately. Fire-and-forget
+	// so the trade return path doesn't block on anchor work.
+	dispatchProgram("/anchor", "mineIfDirty", [{}]).catch(() => {});
 
 	return { offerId, makerPubkey };
 }
@@ -451,6 +455,10 @@ async function acceptOfferOrchestration(ctx: ProgramContext, args: {
 
 	const storeActor = (client as any).storeActor.getOrCreate(["root"]);
 	await storeActor.pushChangesBatch(JSON.stringify(batchEntries));
+	// Per-transaction anchoring: trigger /anchor's dirty check so the
+	// fresh bucket/offer state is captured immediately. Fire-and-forget
+	// so the trade return path doesn't block on anchor work.
+	dispatchProgram("/anchor", "mineIfDirty", [{}]).catch(() => {});
 
 	return { takerPubkey };
 }
@@ -533,6 +541,10 @@ async function cancelOfferOrchestration(ctx: ProgramContext, args: {
 
 	const storeActor = (client as any).storeActor.getOrCreate(["root"]);
 	await storeActor.pushChangesBatch(JSON.stringify(batchEntries));
+	// Per-transaction anchoring: trigger /anchor's dirty check so the
+	// fresh bucket/offer state is captured immediately. Fire-and-forget
+	// so the trade return path doesn't block on anchor work.
+	dispatchProgram("/anchor", "mineIfDirty", [{}]).catch(() => {});
 
 	return { returned };
 }
@@ -620,6 +632,10 @@ async function claimOfferOrchestration(ctx: ProgramContext, args: {
 
 	const storeActor = (client as any).storeActor.getOrCreate(["root"]);
 	await storeActor.pushChangesBatch(JSON.stringify(batchEntries));
+	// Per-transaction anchoring: trigger /anchor's dirty check so the
+	// fresh bucket/offer state is captured immediately. Fire-and-forget
+	// so the trade return path doesn't block on anchor work.
+	dispatchProgram("/anchor", "mineIfDirty", [{}]).catch(() => {});
 	return { claimed: myOutputs.length };
 }
 

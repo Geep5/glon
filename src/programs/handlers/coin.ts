@@ -856,6 +856,12 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 					const client = ctx.client as any;
 					const storeActor = client.storeActor.getOrCreate(["root"]);
 					await storeActor.pushChangesBatch(JSON.stringify(batchEntries));
+					// Per-transaction anchoring: fire mineIfDirty after the
+					// commit so the new bucket head is captured in an
+					// anchor immediately instead of waiting up to 60s for
+					// /anchor's watchdog tick. Fire-and-forget so the
+					// transaction return path doesn't block on anchor work.
+					dispatchProgram("/anchor", "mineIfDirty", [{}]).catch(() => {});
 
 					print(green("Offer created!"));
 					print(dim("  offer:  ") + offerId);
@@ -1025,6 +1031,12 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 					const client = ctx.client as any;
 					const storeActor = client.storeActor.getOrCreate(["root"]);
 					await storeActor.pushChangesBatch(JSON.stringify(batchEntries));
+					// Per-transaction anchoring: fire mineIfDirty after the
+					// commit so the new bucket head is captured in an
+					// anchor immediately instead of waiting up to 60s for
+					// /anchor's watchdog tick. Fire-and-forget so the
+					// transaction return path doesn't block on anchor work.
+					dispatchProgram("/anchor", "mineIfDirty", [{}]).catch(() => {});
 
 					print(green("Offer accepted and settled!"));
 					print(dim("  offer:  ") + offerId);
@@ -1112,6 +1124,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				batchEntries.push({ objectId: offerId, changesBase64: signedCancelB64 });
 
 				await store.pushChangesBatch(JSON.stringify(batchEntries));
+				dispatchProgram("/anchor", "mineIfDirty", [{}]).catch(() => {});
 
 				print(green("Offer cancelled. Escrow returned to maker as claimable outputs."));
 				print(dim("  offer: ") + offerId);
@@ -1214,6 +1227,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 					}
 
 					await (store as any).pushChangesBatch(JSON.stringify(batchEntries));
+					dispatchProgram("/anchor", "mineIfDirty", [{}]).catch(() => {});
 					print(green("Claimed outputs!"));
 					for (const [coinId, out] of myOutputs) {
 						print(`  ${out.amount} ${cyan(out.tokenId.slice(0, 8) + "...")} → your bucket`);
@@ -1496,6 +1510,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
 				const batch = await buildX402SettleBatch(auth, ctx, keyName);
 				await (store as any).pushChangesBatch(JSON.stringify(batch));
+				dispatchProgram("/anchor", "mineIfDirty", [{}]).catch(() => {});
 
 				// Record nonce consumed
 				await dispatchProgram("/consensus", "recordX402Accepted", [auth.nonce]);
@@ -1583,6 +1598,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				const batch = await buildX402SettleBatch(input.authorization, ctx, input.keyName ?? "default");
 				const store = ctx.store as any;
 				await store.pushChangesBatch(JSON.stringify(batch));
+				dispatchProgram("/anchor", "mineIfDirty", [{}]).catch(() => {});
 
 				// Record nonce consumed
 				await ctx.dispatchProgram("/consensus", "recordX402Accepted", [input.authorization.nonce]);
