@@ -389,6 +389,47 @@ export async function verifyOpSignature(op: AuctionOp, view: any): Promise<boole
 	return ed25519Verify(new Uint8Array(pubkey), message, new Uint8Array(signature));
 }
 
+// ── Expiry helper ────────────────────────────────────────────────
+
+/**
+ * Lazy expiry. If the auction is open and `nowMs >= auction.expiry_ms`,
+ * refund the seller's escrowed assets, mark the auction `expired`, and
+ * return true. Otherwise return false (no state change).
+ *
+ * "nowMs" is the timestamp of the op currently being applied — NOT the
+ * wall clock. This is what keeps expiry deterministic across nodes:
+ * everyone sees the same op stream and uses the same `created_at`
+ * values, so everyone computes the same expiry transitions.
+ *
+ * Safety: an attacker could post an op with a far-future `created_at` to
+ * force premature expiry of someone else's auction. The worst case is
+ * the seller gets their escrow refunded early — no value is stolen.
+ * v2 can tighten this with a max-seen-timestamp gate.
+ */
+async function tryExpireAuction(view: any, auctionId: string, nowMs: number): Promise<boolean> {
+	const auctionRaw = await view.get(`auction/${auctionId}`);
+	if (!auctionRaw) return false;
+	const auction = JSON.parse(typeof auctionRaw.value === "string" ? auctionRaw.value : auctionRaw.value.toString("utf-8"));
+	if (auction.status !== "open") return false;
+	if (typeof auction.expiry_ms !== "number" || auction.expiry_ms > nowMs) return false;
+
+	// Refund seller's escrow — same logic as auction.cancel.
+	for (const asset of auction.give ?? []) {
+		if (asset.object_id) {
+			await view.put(`coin/${asset.object_id}`, JSON.stringify({ owner: auction.seller_pubkey }));
+		} else if (asset.token && asset.amount) {
+			const sellerKey = `balance/${asset.token}/${auction.seller_pubkey}`;
+			const sellerRaw = await view.get(sellerKey);
+			const sellerBal = sellerRaw ? BigInt(typeof sellerRaw.value === "string" ? sellerRaw.value : sellerRaw.value.toString("utf-8")) : 0n;
+			await view.put(sellerKey, (sellerBal + BigInt(asset.amount)).toString());
+		}
+	}
+	auction.status = "expired";
+	auction.expired_at = nowMs;
+	await view.put(`auction/${auctionId}`, JSON.stringify(auction));
+	return true;
+}
+
 // ── Apply function (the merge rule) ──────────────────────────────
 
 /**
@@ -447,13 +488,18 @@ export async function apply(nodes: Array<{ value: Buffer | string; from?: { key:
 			case "auction.create": {
 				const existing = await view.get(`auction/${op.id}`);
 				if (existing) break; // id collision; first writer wins
+				// Validate expiry: every auction MUST have a future expiry.
+				// expiry_ms == created_at counts as already-expired and is rejected.
+				let invalidReason: string | null = null;
+				if (typeof op.expiry_ms !== "number" || op.expiry_ms <= op.created_at) {
+					invalidReason = "invalid_expired_on_creation";
+				}
 				// Try to escrow each asset in `give`:
 				//   - object_id: unique item — check coin/<id> isn't already escrowed
 				//   - token+amount: fungible — check seller has the balance
 				// If any escrow fails, the auction lands in an invalid_* state and
 				// no escrow side-effects are applied.
-				let invalidReason: string | null = null;
-				for (const asset of op.give) {
+				if (!invalidReason) for (const asset of op.give) {
 					if (asset.object_id) {
 						const escrow = await view.get(`coin/${asset.object_id}`);
 						if (escrow) { invalidReason = "invalid_double_escrow"; break; }
@@ -486,14 +532,24 @@ export async function apply(nodes: Array<{ value: Buffer | string; from?: { key:
 				break;
 			}
 			case "auction.bid": {
+				// Lazy-expire any open auction whose deadline has passed by
+				// this op's timestamp. After this, status may flip to expired
+				// and the bid below is dropped.
+				await tryExpireAuction(view, op.auction_id, op.created_at);
 				const auctionRaw = await view.get(`auction/${op.auction_id}`);
 				if (!auctionRaw) break; // bid on missing auction; ignore
+				const auction = JSON.parse(typeof auctionRaw.value === "string" ? auctionRaw.value : auctionRaw.value.toString("utf-8"));
+				if (auction.status !== "open") break; // expired/settled/cancelled/invalid — drop bid
 				// Bids are stored under the auction; settle-time validation
 				// happens in auction.settle.
 				await view.put(`auction/${op.auction_id}/bids/${op.bidder_pubkey}/${op.created_at}`, JSON.stringify(op));
 				break;
 			}
 			case "auction.settle": {
+				// Lazy-expire first. If the settle op arrives after the
+				// deadline, the auction expires and the settle is dropped —
+				// seller gets refunded, not the proposed winner.
+				await tryExpireAuction(view, op.auction_id, op.created_at);
 				const auctionRaw = await view.get(`auction/${op.auction_id}`);
 				if (!auctionRaw) break;
 				const auction = JSON.parse(typeof auctionRaw.value === "string" ? auctionRaw.value : auctionRaw.value.toString("utf-8"));
@@ -550,6 +606,11 @@ export async function apply(nodes: Array<{ value: Buffer | string; from?: { key:
 				break;
 			}
 			case "auction.cancel": {
+				// Lazy-expire first. If the auction already expired by this
+				// cancel op's timestamp, tryExpireAuction has already refunded
+				// the seller and flipped status to expired. The cancel below
+				// becomes a no-op (status !== "open"), which is correct.
+				await tryExpireAuction(view, op.auction_id, op.created_at);
 				const auctionRaw = await view.get(`auction/${op.auction_id}`);
 				if (!auctionRaw) break;
 				const auction = JSON.parse(typeof auctionRaw.value === "string" ? auctionRaw.value : auctionRaw.value.toString("utf-8"));

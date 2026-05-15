@@ -96,6 +96,26 @@ function parseAsset(spec: string): AuctionAsset {
 	return { object_id: trimmed };
 }
 
+/** Parse a human duration like "30m", "1h", "2d" into milliseconds.
+ *  Bare numbers are treated as ms. Returns null on parse failure. */
+export function parseDuration(spec: string): number | null {
+	const m = /^(\d+)(ms|s|m|h|d)?$/.exec(spec.trim().toLowerCase());
+	if (!m) return null;
+	const n = parseInt(m[1], 10);
+	if (!Number.isFinite(n) || n <= 0) return null;
+	switch (m[2]) {
+		case "d": return n * 86_400_000;
+		case "h": return n * 3_600_000;
+		case "m": return n * 60_000;
+		case "s": return n * 1_000;
+		case "ms":
+		case undefined:
+		default:  return n;
+	}
+}
+
+const DEFAULT_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24h
+
 // ── Core operations ──────────────────────────────────────────────
 
 async function doPost(ctx: ProgramContext, args: {
@@ -108,7 +128,10 @@ async function doPost(ctx: ProgramContext, args: {
 	requireAutobase();
 	const seller = await resolveWalletPubkey(ctx, args.keyName);
 	const created_at = Date.now();
-	const expiry_ms = args.expiryMs ?? (created_at + 24 * 60 * 60 * 1000); // 24h default
+	const expiry_ms = args.expiryMs ?? (created_at + DEFAULT_EXPIRY_MS);
+	if (expiry_ms <= created_at) {
+		throw new Error(`auction: expiry_ms (${expiry_ms}) must be after created_at (${created_at})`);
+	}
 
 	const opNoSig: Omit<AuctionCreateOp, "signature"> = {
 		kind: "auction.create",
@@ -306,11 +329,23 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 		}
 
 		case "post": {
-			// Syntax: auction post <giveSpec> for <wantSpec> [with <key>] [to <pubkey>]
-			const forIdx = args.indexOf("for");
-			if (forIdx < 1) { print(red("Usage: auction post <give> for <want> [with <key>] [to <pubkey>]")); break; }
-			const giveSpec = args.slice(0, forIdx).join(" ");
-			let rest = args.slice(forIdx + 1);
+			// Syntax: auction post <giveSpec> for <wantSpec> [with <key>] [to <pubkey>] [--expires=<duration>]
+			// Strip the --expires flag from args first so positional parsing stays simple.
+			let expiryMs: number | undefined;
+			const filteredArgs: string[] = [];
+			for (const a of args) {
+				if (a.startsWith("--expires=")) {
+					const dur = parseDuration(a.split("=")[1]);
+					if (dur === null) { print(red(`Invalid --expires value (use forms like 30m, 1h, 2d)`)); return; }
+					expiryMs = Date.now() + dur;
+				} else {
+					filteredArgs.push(a);
+				}
+			}
+			const forIdx = filteredArgs.indexOf("for");
+			if (forIdx < 1) { print(red("Usage: auction post <give> for <want> [with <key>] [to <pubkey>] [--expires=<duration>]")); break; }
+			const giveSpec = filteredArgs.slice(0, forIdx).join(" ");
+			let rest = filteredArgs.slice(forIdx + 1);
 			let wantParts: string[] = [];
 			let keyName = "default";
 			let recipient: string | undefined;
@@ -319,16 +354,18 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				if (rest[0] === "to" && rest.length >= 2) { recipient = rest[1]; rest = rest.slice(2); continue; }
 				wantParts.push(rest[0]); rest = rest.slice(1);
 			}
-			if (wantParts.length === 0) { print(red("Usage: auction post <give> for <want> [with <key>] [to <pubkey>]")); break; }
+			if (wantParts.length === 0) { print(red("Usage: auction post <give> for <want> [with <key>] [to <pubkey>] [--expires=<duration>]")); break; }
 			try {
 				const r = await doPost(ctx, {
 					give: [parseAsset(giveSpec)],
 					want: [parseAsset(wantParts.join(" "))],
 					keyName,
 					recipient,
+					expiryMs,
 				});
 				print(green("Auction posted"));
-				print(dim("  id: ") + r.auctionId);
+				print(dim("  id:      ") + r.auctionId);
+				if (expiryMs) print(dim("  expires: ") + new Date(expiryMs).toISOString());
 			} catch (err: any) {
 				print(red("  Error: ") + (err?.message ?? String(err)));
 			}
@@ -336,26 +373,39 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 		}
 
 		case "gift": {
-			// Syntax: auction gift <amount> <token> to <pubkey> [with <key>]
-			if (args.length < 4 || args[2] !== "to") {
-				print(red("Usage: auction gift <amount> <token> to <pubkey> [with <key>]"));
+			// Syntax: auction gift <amount> <token> to <pubkey> [with <key>] [--expires=<duration>]
+			let expiryMs: number | undefined;
+			const filteredArgs: string[] = [];
+			for (const a of args) {
+				if (a.startsWith("--expires=")) {
+					const dur = parseDuration(a.split("=")[1]);
+					if (dur === null) { print(red(`Invalid --expires value`)); return; }
+					expiryMs = Date.now() + dur;
+				} else {
+					filteredArgs.push(a);
+				}
+			}
+			if (filteredArgs.length < 4 || filteredArgs[2] !== "to") {
+				print(red("Usage: auction gift <amount> <token> to <pubkey> [with <key>] [--expires=<duration>]"));
 				break;
 			}
-			const amount = args[0];
-			const token = args[1];
-			const recipient = args[3];
-			const keyName = args[5] && args[4] === "with" ? args[5] : "default";
+			const amount = filteredArgs[0];
+			const token = filteredArgs[1];
+			const recipient = filteredArgs[3];
+			const keyName = filteredArgs[5] && filteredArgs[4] === "with" ? filteredArgs[5] : "default";
 			try {
 				const r = await doPost(ctx, {
 					give: [{ token, amount }],
 					want: [], // no exchange — pure gift
 					keyName,
 					recipient,
+					expiryMs,
 				});
 				print(green("Gift sent"));
 				print(dim("  to:     ") + recipient.slice(0, 32) + (recipient.length > 32 ? "..." : ""));
 				print(dim("  amount: ") + `${amount} ${token}`);
 				print(dim("  id:     ") + r.auctionId);
+				if (expiryMs) print(dim("  expires: ") + new Date(expiryMs).toISOString());
 			} catch (err: any) {
 				print(red("  Error: ") + (err?.message ?? String(err)));
 			}
@@ -430,8 +480,8 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				`    ${cyan("auction status")}                              ledger health snapshot`,
 				`    ${cyan("auction join")}                                broadcast a join request (run on first start)`,
 				`    ${cyan("auction list")}                                local view of all auctions`,
-				`    ${cyan("auction post")} ${dim("<give> for <want> [to <pubkey>]")}  post an auction`,
-				`    ${cyan("auction gift")} ${dim("<amount> <token> to <pubkey>")}     send tokens to someone`,
+				`    ${cyan("auction post")} ${dim("<give> for <want> [to <pubkey>] [--expires=1h]")}  post (default expiry 24h)`,
+				`    ${cyan("auction gift")} ${dim("<amount> <token> to <pubkey> [--expires=1h]")}     send tokens to someone`,
 				`    ${cyan("auction bid")} ${dim("<auctionId> <amount> <token>")}      bid on an open auction`,
 				`    ${cyan("auction settle")} ${dim("<auctionId> <winnerPubkey>")}     seller picks a winner`,
 				`    ${cyan("auction cancel")} ${dim("<auctionId>")}                    seller cancels an open auction`,
