@@ -538,9 +538,37 @@ export async function apply(nodes: Array<{ value: Buffer | string; from?: { key:
 						}
 					}
 				}
+				// Gifts (recipient set + empty want) atomically auto-settle:
+				// the sender's intent is "send X to Y," so we transfer in the
+				// same apply pass rather than making the sender call settle
+				// later. Fungibles' escrow has already been deducted above;
+				// here we credit the recipient. Unique items flip their
+				// coin/<id> record from escrowed_in to owner.
+				const isAutoSettleGift = !invalidReason
+					&& !!op.recipient_pubkey
+					&& (!op.want || op.want.length === 0);
+				if (isAutoSettleGift) {
+					for (const asset of op.give) {
+						if (asset.object_id) {
+							await view.put(`coin/${asset.object_id}`, JSON.stringify({ owner: op.recipient_pubkey }));
+						} else if (asset.token && asset.amount) {
+							const recipKey = `balance/${asset.token}/${op.recipient_pubkey}`;
+							const recipRaw = await view.get(recipKey);
+							const recipBal = recipRaw ? BigInt(typeof recipRaw.value === "string" ? recipRaw.value : recipRaw.value.toString("utf-8")) : 0n;
+							await view.put(recipKey, (recipBal + BigInt(asset.amount)).toString());
+						}
+					}
+				}
+
 				await view.put(`auction/${op.id}`, JSON.stringify({
 					...op,
-					status: invalidReason ?? "open",
+					status: invalidReason ?? (isAutoSettleGift ? "settled" : "open"),
+					...(isAutoSettleGift ? {
+						winner_pubkey: op.recipient_pubkey,
+						settled_at: op.created_at,
+						settled_payment: [],
+						auto_settled_gift: true,
+					} : {}),
 				}));
 				await view.put(`peer/${op.seller_pubkey}/auctions/${op.id}`, JSON.stringify({ id: op.id, created_at: op.created_at }));
 				break;
