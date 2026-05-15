@@ -35,7 +35,7 @@ Three layers, deliberately separated:
 
 Values are recursive and typed at the protobuf level — string/int/float/bool/bytes/list/map/`ObjectLink` — so a browser can store cookie jars as nested maps and a spreadsheet can store cell metadata as typed lists without anyone touching `glon.proto`.
 
-A `Change` carries one optional auth field: `auth_extension`, a generic `{type: string, payload: bytes}` shape. The kernel looks up a registered `AuthVerifierFn` by `type` and verifies the payload against the change's canonical bytes before any program validator sees the change. The chain layer registers `"ed25519"`; payment programs register their own (e.g. `"x402"`). The kernel itself knows nothing about either.
+A `Change` carries one optional auth field: `auth_extension`, a generic `{type: string, payload: bytes}` shape. The kernel looks up a registered `AuthVerifierFn` by `type` and verifies the payload against the change's canonical bytes before any program validator sees the change. The chain layer registers `"ed25519"` (`Signature` proto = pubkey + 64-byte signature, no nonce/fee — replay protection lives at the autobase apply layer for money, and at the kernel sig gate for non-money DAG ops). The kernel itself knows nothing about specific auth types.
 
 There is no separate `ContentSet` op for raw byte content. An object that wants a primary blob — a source file, an image, a binary — stores it in a designated block with id `__content__` whose `CustomContent` carries the bytes. `getPrimaryContent(blocks)` extracts it. One concept (blocks) instead of two (blocks + content).
 
@@ -67,33 +67,39 @@ There are roughly four families of programs in this repo:
 - `transport-discord` — sends payloads as Discord DMs via the existing `/discord` program. Address format: `discord://<user_id>`.
 - `transport-http` — POSTs JSON envelopes to a remote endpoint. Address format: `https://host:port/path`.
 - `transport-gmail` — sends and receives envelopes via Gmail using the local `gcloud` CLI's OAuth token (no separate OAuth app to register). Address format: `gmail://<email-address>`. Kept in the codebase for occasional use (e.g. inviting non-Glon friends), but no longer load-bearing for trades after the Hyperswarm migration.
-- `transport-hyperswarm` — sends and receives envelopes over **Hyperswarm**, the peer-to-peer networking stack from Holepunch. The daemon owns one Hyperswarm instance (bring up with `GLON_SWARM=1` in env); the `transport-hyperswarm` program is a thin wrapper that calls into the daemon-level `swarm-host` module. Address format: `swarm://<64-hex-hyperswarm-pubkey>`. Connections are end-to-end Noise-encrypted; framing is a 4-byte BE length prefix per envelope. Two peers find each other through the public **directory topic** (`sha256("glon:network:v1")`) or through any **pair topic** they both know (`sha256("glon:pair:v1:" + sorted_concat(pubkeys))`). Used by `/directory` for peer presence + handshake and by `/trade` for the actual swap traffic.
+- `transport-hyperswarm` — sends and receives envelopes over **Hyperswarm**, the peer-to-peer networking stack from Holepunch. The daemon owns one Hyperswarm instance (bring up with `GLON_SWARM=1` in env); the `transport-hyperswarm` program is a thin wrapper that calls into the daemon-level `swarm-host` module. Address format: `swarm://<64-hex-hyperswarm-pubkey>`. Connections are end-to-end Noise-encrypted; framing is a 4-byte BE length prefix per envelope. Two peers find each other through the public **directory topic** (`sha256("glon:network:v1")`) or through any **pair topic** they both know (`sha256("glon:pair:v1:" + sorted_concat(pubkeys))`). Used by `/directory` for peer presence + handshake and by `/auction` for the auction-house join broadcast.
 - `transport-router` — polls every registered transport's `inbox_drain`, dispatches by `content_type` through a content-handler registry (`registerContentHandler` in `runtime.ts`). Built-in handlers: `glon/change-bundle` (imports each Change via `objectActor.pushChanges`), `glon/text` (logs to stdout). The handler signature includes `blobMeta.fromEndpoint` so content handlers can authenticate by the address the blob arrived from.
 
-**Chain layer.** A small Chia-style proof-of-spacetime blockchain runs on top of the same kernel:
+**Auction-house layer (autobase ledger).** A permissionless P2P auction house and a fungible-token system both ride on a shared **autobase** — Holepunch's multi-writer append-only log — replicated over Hyperswarm. There is no proof-of-spacetime, no nonce gate, no anchor chain. Consensus is **deterministic CRDT merge** across replicated writer hypercores: every node computes the same view by replaying the same ordered set of ops, and conservation rules are enforced inside the apply function.
 
-- `wallet` — local Ed25519 keys, never on the DAG. Receives an unsigned `Change`, fills in the signature payload, returns it content-addressed.
-- `consensus` — validator gate for chain-mode types. Per-pubkey monotonic nonce, asymmetric fee floors (deploy 100×, mint 10×, other 1×), dispatches type-specific semantic checks to the owning program through its declared typed actions.
-- `coin` — UTXO-based fungible tokens. `chain.token` holds metadata; `chain.coin.bucket` objects hold up to 1000 coins each as `BlockAdd` ops. Atomic swaps via `chain.coin.offer` objects with two-pass replay so `settle` can land before its `escrow`/`pay`. Registers an `IndexHookFn` for `chain.coin.bucket` so the kernel maintains the SQL coin index without importing anything from this file. Cross-DAG sends package spend+create changes into a `ChangeBundle` dispatched through the transport layer.
-- `coin-x402` — pure helpers for x402 payment authorization (canonical encoding, signature verification). Used by `coin.ts` for offer settlement; could be picked up by other programs that want the same payment shape.
-- `anchor` — global ordering and Merkle state commitment over chain-mode head ids. Longest-chain fork choice with timestamp tiebreak. Inflation rewards in FIG (5 FIG base, halving every 1000 anchors) paid to anchor creators. Each anchor change carries `state_root` (Merkle root of chain head ids), `prev_anchor_id` (parent anchor for linear ordering), and optional `pospace_proof` (hex proof bytes for future PoSpace integration).
-- `plot` — real Proof of Space via shelling out to `chiapos` (Chia's plotter), default `k=25` (~600 MB) for testing, `k=32` (~101 GB) for mainnet-equivalent.
-- `timelord` — real Proof of Time via `chiavdf` (Wesolowski VDFs, class groups of unknown order, 1024-bit discriminant), default 5M iterations.
-- `trade` — drives a full atomic swap end-to-end over **Hyperswarm**. User says "trade 5 FIG for 10 GOOTECK with bob" in any chat surface; the program resolves bob via `/peer` (must be `trust_level: "trusted"` — see `/directory`), builds and escrows the offer locally, exports the changes as a `ChangeBundle`, sends them via `/transport-hyperswarm` with `content_type=glon/swap-offer` to bob's hyperswarm pubkey. The receiver's flow is symmetric: incoming `glon/swap-offer` from an untrusted swarm pubkey is dropped silently; from a trusted peer it surfaces to the human via `/user-chat`, `/trade accept <id>` pays + settles + claims and replies with `glon/swap-response`, `/trade decline <id>` (or the 5-min approval-deadline expiring) replies with `glon/swap-decline`. Originator timeout default 30 min with cancel-return on expiry; receiver-approval default 5 min — both env-overridable. Per-swap state lives in the program object's `persisted_state` field and survives daemon restarts. *(This replaces the earlier `/swap-email` program, which was removed in v1 of the Hyperswarm peering work; see `docs/hyperswarm-peering.md`.)*
-- `directory` — Hyperswarm peer presence + first-contact handshake. On daemon start with `GLON_SWARM=1`, joins a well-known directory topic and broadcasts a signed `glon/peer-announce` every 60s. Other Glons' announces upsert into local `/peer` as `trust_level: "discovered"`. When the user clicks "peer with" (UI button in Astrolabe's Network panel, or `/directory peer <pubkey>` in chat), this program sends a `glon/peer-request` unicast to that peer; the receiver surfaces "Alice wants to peer, accept?" via `/user-chat`. On accept both sides flip the `/peer` record to `trust_level: "trusted"`. After that, `/trade` traffic between them flows over the persistent pair-topic connection.
+- `wallet` — local Ed25519 keys, never on the DAG and never in the autobase. Receives an unsigned op (or `Change`), produces a 64-byte signature over its canonical bytes, returns it. `~/.glon/wallet.json`, mode 0600.
+- `autobase-host` (`src/autobase-host.ts`, daemon-level) — owns the single Autobase instance, a Corestore backed by `~/.glon/autobase/`, and a Hyperbee view. Programs reach it through the runtime externals map (same pattern as `swarm-host`). Exposes `appendOp`, `viewGet`, `viewList`, `isWritable`, `statusSnapshot`, and the deterministic **`apply` function** that all peers run on every replicated op. Bring it up with `GLON_AUCTION=1` in env.
+- `auction` — the auction-house CLI + actor. Three primitives that double as four user actions: `auction post <give> for <want> [to <pubkey>]` posts an auction, `auction gift <amount> <token> to <pubkey>` is a degenerate auction with `recipient` set and `want=[]` (the "send Alice 10 FIG" surface), `auction bid <id> <amount> <token>` adds a bid, `auction settle <id> <winner>` declares a winner and moves balances. Every op is signed by the actor's chain key; the apply function verifies the signature before any state change. **Auto peer-join over Hyperswarm:** while a node is not yet a writer, an `onTick` every 15s broadcasts a signed `glon/auction-join` envelope on the directory topic. Existing writers' content handlers relay the signed join op into the autobase, the apply function calls `host.addWriter`, and the joiner becomes writable.
+- `coin` — fungible tokens on the autobase. `coin deploy <name> <symbol> <supply> [--decimals=N] [--mint-renounced]` posts a `coin.deploy` op that registers the token at `token/<token_id>` (id is `sha256(canonical(deploy without id/signature))`) and credits the full supply to the deployer. `coin mint`/`transfer`/`burn` post the matching ops; the apply function debits and credits `balance/<token_id>/<pubkey>` keys in the hyperbee view, refusing any transfer that would overdraw. Mint authority is enforced by looking up the token's owner at apply time. `coin balance` and `coin holders` are pure hyperbee reads. **FIG is not protocol-privileged** — it's just whatever first token someone deploys on a given network. Game tokens, gold coins, IOUs all use the same primitive.
+- `directory` — Hyperswarm peer presence + first-contact handshake. On daemon start with `GLON_SWARM=1`, joins a well-known directory topic and broadcasts a signed `glon/peer-announce` every 60s. Other Glons' announces upsert into local `/peer` as `trust_level: "discovered"`. When the user clicks "peer with" (UI button in Astrolabe's Network panel, or `/directory peer <pubkey>` in chat), this program sends a `glon/peer-request` unicast to that peer; the receiver surfaces "Alice wants to peer, accept?" via `/user-chat`. On accept both sides flip the `/peer` record to `trust_level: "trusted"`. Trust here is **a UX filter for `/peer-chat`**, not a security gate for the auction house — the autobase is permissionless and conservation is enforced at apply, not by who's in your trust graph.
 
-The chain layer is genuinely separate from the object/agent kernel — it just rides the same `Change` DAG, registers an Ed25519 verifier with the kernel for `auth_extension.type = "ed25519"`, and uses `consensus.validate()` to gate which changes survive before the kernel writes them to disk.
+**How the auction house actually works.** Each glon node generates a Hypercore writer key locally (persisted in its corestore). When the node bootstraps a fresh autobase, that's the founder of a new network; when it boots with `GLON_AUTOBASE_BOOTSTRAP=<hex>`, it joins the existing network identified by that pubkey. Founders publish their bootstrap pubkey out-of-band (README, gossip, env). Once two nodes are both online and the joiner has been admitted (via a signed `peer.join` op that any existing writer can relay), their writer hypercores replicate over a Hyperswarm topic derived from `base.discoveryKey`. The apply function — pure, deterministic, runs on every node — is the consensus rule:
+
+- `auction.create` with fungible `give[]` deducts the seller's `balance/<token>/<seller>` immediately. Insufficient balance → the auction lands as `invalid_insufficient_balance` and the seller's balance is untouched. Unique `give[]` items use `coin/<object_id>` as an escrow record; the second auction to try to escrow the same item lands as `invalid_double_escrow`.
+- `auction.bid` records the bid under the auction (no balance escrow at bid time — that's a v1.1 tightening).
+- `auction.settle`, signed by the seller, transfers `give[]` to the winner and `want[]` from winner to seller. If the winner lacks the `want[]` balance, the settle is rejected and stamped `invalid_winner_insufficient_balance`.
+- `auction.cancel`, signed by the seller, refunds any escrowed fungibles back to the seller.
+
+Two nodes that have replicated the same set of writer hypercores compute byte-identical views. There is no leader, no fork-choice rule beyond autobase's deterministic linearizer, and no privileged "founder" key in protocol terms — anyone can bootstrap a fresh network with `glon network create` semantics (just run the code without `GLON_AUTOBASE_BOOTSTRAP`).
+
+The auction-house layer is genuinely separate from the object/agent kernel: it doesn't write `Change` DAG ops, it doesn't register a kernel auth verifier, and it has its own canonical signing scheme (`JSON.stringify` with keys sorted lexicographically, `signature` and `id` fields stripped). The DAG layer is still used for everything non-money: agents, chat, todos, programs themselves.
 
 ## Stack
 
 - **Language.** TypeScript, ESM. ~99.8% of the repo by line count.
-- **Runtime.** Node 20+ via `tsx` (no build step in dev). Uses `node:sqlite` for the store index and `node:dgram` for mDNS.
+- **Runtime.** Node 20+ via `tsx` (no build step in dev). Uses `node:sqlite` for the store index.
 - **Actors.** `rivetkit` 2.x. `objectActor` and `storeActor` are defined in `src/index.ts`; `programActor` is dynamically materialized per program by `runtime.ts`.
-- **Wire format.** `protobufjs`. Schema in `proto/glon.proto`. Canonical encoding for signing lives in `src/det/canonical.ts`.
-- **Crypto.** SHA-256 for content addressing (`src/crypto.ts`); Ed25519 for chain signatures (`src/det/ed25519.ts`); `randomBytes` for nonces. Transport envelopes carry a `sender_pubkey` hint, but trust is in the Ed25519 signatures on each individual Change.
-- **Determinism.** `src/det/` carries the bits the chain layer needs to be reproducible across machines: canonical proto encoding, signing, big-int math (`U64_MAX`, `U128_MAX`, bounded add, checked sub).
+- **Wire format (DAG).** `protobufjs`. Schema in `proto/glon.proto`. Canonical encoding for signing lives in `src/det/canonical.ts`.
+- **Auction-house ledger.** Holepunch's [`autobase`](https://github.com/holepunchto/autobase) (multi-writer linearizer), [`corestore`](https://github.com/holepunchto/corestore) (collection of hypercores), [`hyperbee`](https://github.com/holepunchto/hyperbee) (B-tree key/value view), [`hypercore`](https://github.com/holepunchto/hypercore) (append-only signed log), and [`hyperswarm`](https://github.com/holepunchto/hyperswarm) (DHT-based P2P). All native deps stay at the daemon level; programs reach the autobase through `src/autobase-host.ts` exposed via runtime externals (same pattern as `swarm-host` for hyperswarm).
+- **Crypto.** SHA-256 for content addressing (`src/crypto.ts`); Ed25519 for chain signatures and auction ops (`src/det/ed25519.ts`); Hyperswarm Noise (curve25519) for transport. Auction ops are signed over canonical-sorted JSON of the op without `signature`/`id`; `Change`s are signed over the canonical protobuf of the change with `id` zeroed and the signature payload zeroed.
+- **Determinism.** `src/det/` carries the bits the chain layer needs to be reproducible across machines: canonical proto encoding, Ed25519 signing, big-int math (`U64_MAX`, `U128_MAX`, bounded add, checked sub).
 - **Bundler.** `esbuild`, used at runtime to compile programs out of the DAG.
-- **Optional native binaries.** `chiapos` and `chiavdf` under `~/.glon/bin/` if you want real PoSpace/PoT. Optional Skyvern at `127.0.0.1:8000` if agents need a real browser.
+- **Optional.** Skyvern at `127.0.0.1:8000` if agents need a real browser.
 - **Other deps.** `nostr-tools` is in `package.json` (presumably for an identity/event-bridge experiment, no handler imports it directly in this snapshot).
 
 ## Quick start
@@ -116,6 +122,18 @@ npm run client
 The dev server fails fast if port 6420 is taken; override with `GLON_PORT`. Clients auto-discover the chosen port via `~/.glon/.endpoint`.
 
 For headless/automated use there's `scripts/daemon.ts`, which loads every program, runs their actors and tick loops, and exposes `POST /dispatch {prefix, action, args}` on `127.0.0.1:6430` so any external orchestrator can drive Glon without holding API keys. Run it with `--dev` to enable a file watcher: when a `src/programs/handlers/*.ts` file changes, the daemon re-bootstraps the affected program object (disk → DAG), stops its actor, recompiles from the updated source, and restarts. Without `--dev`, programs only update on explicit `npm run bootstrap` followed by a daemon restart.
+
+**Bringing the auction house online:**
+
+```bash
+# everything: actor host + Hyperswarm + autobase ledger
+GLON_SWARM=1 GLON_AUCTION=1 npx tsx scripts/daemon.ts
+
+# join an existing network (founder shares their bootstrap pubkey):
+GLON_AUTOBASE_BOOTSTRAP=<64-hex-pubkey> GLON_SWARM=1 GLON_AUCTION=1 npx tsx scripts/daemon.ts
+```
+
+See [RUNBOOK.md](RUNBOOK.md) for a full two-daemon walkthrough that exercises deploy → gift → bid → settle end-to-end with real balance tracking.
 
 The bootstrap is content-aware: it hashes each source file, compares against what's in the store, and prints `UNCHANGED` for no-op runs. Add `--force` to rewrite unconditionally if you've corrupted an object and want a clean reseed.
 
@@ -145,23 +163,32 @@ src/
   bootstrap.ts                walks src/, proto/, scripts/; hashes files;
                               creates or updates the corresponding store objects
   client.ts                   the CLI shell (a pure program loader, no built-ins)
+  swarm-host.ts               daemon-level Hyperswarm singleton (transport)
+  autobase-host.ts            daemon-level autobase + corestore + hyperbee
+                              singleton, plus the deterministic apply function +
+                              JSON op codec for the auction house
   dag/
     change.ts                 change construction + content-address hashing
     dag.ts                    topological sort, snapshot replay, head computation,
                               getPrimaryContent for the __content__ block
-  det/                        determinism layer for the chain
-    canonical.ts              canonical encoding for signing
-    ed25519.ts                signing + verification
+  det/                        determinism layer for signing + math
+    canonical.ts              canonical proto encoding for signing Changes
+    ed25519.ts                signing + verification (raw 32-byte keys)
     math.ts                   bounded big-int arithmetic
-  sync/                       mDNS discovery + peer types (the wire layer)
   programs/
     runtime.ts                module bundler, actor lifecycle, dispatch table,
-                              registries (validator, indexHook, authVerifier)
+                              registries (validator, indexHook, authVerifier,
+                              contentHandler). Exposes swarm-host + autobase-host
+                              as externals to bundled programs.
     shared.ts                 ANSI styling + typed field extractors
-    handlers/                 one file per program (~35, see Application Layer above)
-scripts/                      operational tools (daemon, dispatch, dumps, repairs)
-test/                         unit tests for kernel, agents, chain, programs, transports
-docs/                         design notes (coin offers, transports, trading system)
+    handlers/                 one file per program (see Application Layer above)
+scripts/
+  daemon.ts                   the long-running daemon. Brings up the swarm with
+                              GLON_SWARM=1 and the autobase with GLON_AUCTION=1.
+test/                         unit tests for kernel, agents, programs, transports,
+                              auction-house ledger (replication, sig verify,
+                              auto-join, balance-aware lifecycle, real Hyperswarm DHT)
+docs/                         design notes (transports, peering, trading system)
 ```
 
 ## License

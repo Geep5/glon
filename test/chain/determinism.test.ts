@@ -37,8 +37,6 @@
 		const sig = {
 			pubkey: new Uint8Array(32).fill(0xab),
 			signature: new Uint8Array(64).fill(0xcd),
-			nonce: 1,
-			fee: 100,
 		};
 		return {
 			id: new Uint8Array(0),
@@ -172,8 +170,6 @@ describe("canonicalEncodeChange", () => {
 			const sig = {
 				pubkey: new Uint8Array(32).fill(0xab),
 				signature: new Uint8Array(64).fill(0xcd),
-				nonce: 1,
-				fee: 100,
 			};
 			const c = {
 				id: new Uint8Array(0),
@@ -237,27 +233,4 @@ describe("canonicalEncodeChange", () => {
 		assert.notEqual(hexEncode(signing), hexEncode(idding));
 	});
 
-	it("changing nonce or fee changes the signing payload", () => {
-		const c1 = makeRichChange();
-		const s1 = decodeSignature(c1.authExtension!.payload);
-		const c2: Change = {
-			...c1,
-			authExtension: {
-				type: "ed25519",
-				payload: encodeSignature({ ...s1, nonce: s1.nonce + 1 }),
-			},
-		};
-		const c3: Change = {
-			...c1,
-			authExtension: {
-				type: "ed25519",
-				payload: encodeSignature({ ...s1, fee: s1.fee + 1 }),
-			},
-		};
-		const a = canonicalEncodeChangeForSigning(c1);
-		const b = canonicalEncodeChangeForSigning(c2);
-		const d = canonicalEncodeChangeForSigning(c3);
-		assert.notEqual(hexEncode(a), hexEncode(b), "nonce must commit to the signature");
-		assert.notEqual(hexEncode(a), hexEncode(d), "fee must commit to the signature");
-	});
 });

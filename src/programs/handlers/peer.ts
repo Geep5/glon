@@ -51,10 +51,14 @@ import { dim, bold, cyan, red, green, yellow, magenta } from "../shared.js";
  *   discovered — seen on the swarm but no handshake yet
  *   stranger — default for /peer add with no trust set
  *
- * `isPeered()` is the gate every peer-to-peer feature should use (chat,
- * trade, capability discovery). Strict equality on "trusted" is wrong —
- * a peer manually upgraded to "family" should not lose access. Trust
- * RAISES, never lowers, capabilities.
+ * `isPeered()` is a UX filter — used by /peer-chat to scope incoming
+ * messages to known contacts, and by UIs to highlight trusted peers.
+ *
+ * Note: trust here is NOT a security gate for auctions or coin transfers.
+ * The auction-house autobase is permissionless; conservation rules
+ * (signature verification + balance checks) are enforced in apply, not
+ * at the trust layer. Anyone you've never peered with can still post
+ * auctions you'll see in your /auction list.
  */
 export const PEER_TRUSTED_LEVELS: ReadonlySet<string> = new Set(["trusted", "friend", "family", "self"]);
 export function isPeered(trust_level: string | undefined | null): boolean {
@@ -66,7 +70,7 @@ export function isPeered(trust_level: string | undefined | null): boolean {
 //   hyperswarm_pubkey — current Noise pubkey learned via /directory announce.
 //                       May rotate; rewritten on every upsertPeer.
 //   last_seen          — wall-clock ms of last announce/handshake. Used by
-//                       UIs and the trade orchestrator to pick a fresh peer.
+//                       UIs to surface fresh peers.
 //   agents_json — JSON-encoded array of {id, name} from the peer's most
 //                 recent announce. Lets UIs render that peer's specific
 //                 agents and (later) address messages to them by id.

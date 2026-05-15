@@ -63,15 +63,12 @@ message AuthExtension {
   bytes payload = 2;
 }
 
-	// Ed25519 signature plus per-pubkey replay-protection nonce and per-change
-	// fee. For authExtension type "ed25519", the payload contains an encoded
-	// Signature. The signing bytes zero `id` and the signature bytes inside
-	// the payload; pubkey/nonce/fee ARE included (the signer commits to them).
+	// Ed25519 signature. For authExtension type "ed25519", the payload contains
+	// an encoded Signature. The signing bytes zero `id` and the signature bytes
+	// inside the payload; pubkey IS included (the signer commits to it).
 message Signature {
   bytes  pubkey    = 1;    // 32-byte Ed25519 public key
   bytes  signature = 2;    // 64-byte Ed25519 signature
-  uint64 nonce     = 3;    // per-pubkey monotonic; replay protection
-  uint64 fee       = 4;    // micro-units paid to anchor farmer; 0 = no fee
 }
 
 // Atomic mutation within a Change. Applied in order during replay.

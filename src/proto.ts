@@ -119,10 +119,6 @@ export interface Signature {
 	pubkey: Uint8Array;
 	/** 64-byte Ed25519 signature; empty when computing the signing payload. */
 	signature: Uint8Array;
-	/** Monotonic per-pubkey nonce; replay protection. */
-	nonce: number;
-	/** Fee micro-units paid to the anchor farmer. */
-	fee: number;
 }
 
 

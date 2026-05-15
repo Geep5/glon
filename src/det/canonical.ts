@@ -182,8 +182,8 @@ function canonicalizeSnapshot(snap: ObjectSnapshot): ObjectSnapshot {
 	/**
 	 * Bytes the author signs. `id` is zeroed (unknown at signing time).
 	 * For ed25519 authExtension, only the signature bytes inside the payload
-	 * are zeroed; pubkey/nonce/fee ARE committed. For other extension types,
-	 * the entire payload is zeroed.
+	 * are zeroed; pubkey IS committed. For other extension types, the entire
+	 * payload is zeroed.
 	 */
 	export function canonicalEncodeChangeForSigning(change: Change): Uint8Array {
 		const copy = canonicalizeChange(change);

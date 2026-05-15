@@ -160,10 +160,6 @@ interface SignChangeInput {
 	name: string;
 	/** Base64-encoded Change to sign (without authExtension). */
 	changeB64: string;
-	/** Per-pubkey monotonic nonce. Caller must obtain from /consensus. */
-	nonce: number;
-	/** Fee in micro-units. Caller decides. */
-	fee: number;
 }
 
 interface SignChangeResult {
@@ -179,22 +175,14 @@ function doSignChange(input: SignChangeInput, path?: string): SignChangeResult {
 	const file = readWalletFile(path);
 	const entry = file.keys[input.name];
 	if (!entry) throw new Error(`wallet.sign: no key named "${input.name}"`);
-	if (typeof input.nonce !== "number" || !Number.isInteger(input.nonce) || input.nonce < 1) {
-		throw new Error("wallet.sign: nonce must be a positive integer");
-	}
-	if (typeof input.fee !== "number" || !Number.isInteger(input.fee) || input.fee < 0) {
-		throw new Error("wallet.sign: fee must be a non-negative integer");
-	}
 
 	// Decode the unsigned change.
 	const change = decodeChange(new Uint8Array(Buffer.from(input.changeB64, "base64")));
 
-	// Build the signature (pubkey, zeroed sig bytes, nonce, fee).
+	// Build the signature (pubkey, zeroed sig bytes).
 	const sig: Signature = {
 		pubkey: hexDecode(entry.pubkey),
 		signature: new Uint8Array(64),
-		nonce: input.nonce,
-		fee: input.fee,
 	};
 	const candidate: Change = {
 		...change,

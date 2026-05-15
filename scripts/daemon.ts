@@ -119,6 +119,81 @@ async function resolveId(raw: string): Promise<string | null> {
 			}
 		}
 
+		// ── Autobase bring-up (Phase 2 — auction-house ledger) ────
+		// Opt-in via GLON_AUCTION=1 until /auction is fully stitched in.
+		// Replication over Hyperswarm wires in once both are running.
+		if (process.env.GLON_AUCTION === "1") {
+			try {
+				const { default: Corestore } = await import("corestore");
+				const { default: Autobase } = await import("autobase");
+				const { default: Hyperbee } = await import("hyperbee");
+				const autobaseHost = await import("../src/autobase-host.js");
+
+				const corestore = new Corestore(autobaseHost.getCorestoreDir());
+				await corestore.ready();
+
+				// Bootstrap precedence:
+				//   1. GLON_AUTOBASE_BOOTSTRAP env (hex pubkey) — joiner pointing at a known network
+				//   2. ~/.glon/autobase/bootstrap.key — previously joined / created network
+				//   3. none — generate a fresh autobase (this node becomes its own founder)
+				let bootstrap: Buffer | null = null;
+				const envBootstrap = process.env.GLON_AUTOBASE_BOOTSTRAP;
+				if (envBootstrap && /^[0-9a-fA-F]{64}$/.test(envBootstrap)) {
+					bootstrap = Buffer.from(envBootstrap, "hex");
+					console.log(`[daemon] autobase bootstrap from env: ${envBootstrap.slice(0, 16)}...`);
+				} else {
+					bootstrap = autobaseHost.loadPersistedBootstrap();
+				}
+
+				const base = new Autobase(corestore, bootstrap, {
+					open(store: any) {
+						return new Hyperbee(store.get("auction-view"), {
+							keyEncoding: "utf-8",
+							valueEncoding: "utf-8",
+						});
+					},
+					apply: autobaseHost.apply,
+				});
+				await base.ready();
+				// Persist the bootstrap key on first start so subsequent restarts
+				// stay on the same network without env vars.
+				autobaseHost.persistBootstrap(base.key);
+
+				autobaseHost.initAutobase({
+					corestore,
+					autobase: base,
+					view: base.view,
+					writerPubkey: base.local.key,
+				});
+
+				console.log(`[daemon] autobase online — bootstrap key: ${base.key.toString("hex").slice(0, 16)}...`);
+				console.log(`[daemon] autobase writer pubkey: ${base.local.key.toString("hex").slice(0, 16)}...`);
+
+				// ── Autobase replication over its own Hyperswarm ─────
+				// Separate swarm from swarm-host's: that one uses raw framing
+				// for transport envelopes; hypercore replication uses protomux
+				// channels and would conflict on the same stream. Two swarms
+				// is wasteful but cleanly separated. Phase 4+ can consolidate
+				// once swarm-host is protomux-native.
+				try {
+					const { default: Hyperswarm } = await import("hyperswarm");
+					const replSwarm = new Hyperswarm();
+					replSwarm.on("connection", (conn: any) => {
+						corestore.replicate(conn);
+					});
+					replSwarm.join(base.discoveryKey, { server: true, client: true });
+					console.log(`[daemon] autobase replication swarm joined topic ${base.discoveryKey.toString("hex").slice(0, 16)}...`);
+					// Stash on globalThis for shutdown — daemon is short-lived
+					// enough this is fine for v1.
+					(globalThis as any).__glonAutobaseSwarm = replSwarm;
+				} catch (err: any) {
+					console.log(`[daemon] autobase replication swarm failed: ${err?.message ?? err}`);
+				}
+			} catch (err: any) {
+				console.log(`[daemon] autobase bring-up failed: ${err?.message ?? err} (continuing without auction house)`);
+			}
+		}
+
 		let programs: ProgramEntry[] = await loadPrograms(store, client);
 		console.log(`[daemon] loaded ${programs.length} programs`);
 
@@ -292,7 +367,7 @@ async function resolveId(raw: string): Promise<string | null> {
 							console.log(`[daemon] resumed task ${rawId}`);
 						}
 					} else {
-						// Program actor tasks have a leading slash (e.g. "/anchor")
+						// Program actor tasks have a leading slash (e.g. "/auction")
 						const taskId = rawId.startsWith("/") ? rawId : "/" + rawId;
 						const inst = getProgramActorByPrefix(taskId);
 						if (inst && inst.tickHandle) {
@@ -355,22 +430,8 @@ async function resolveId(raw: string): Promise<string | null> {
 						return;
 					}
 
-					// Check nonce not consumed via consensus
-					const consensusInst = getProgramActorByPrefix("/consensus");
-					if (consensusInst) {
-						const status = await dispatchActorAction(
-							consensusInst.programId,
-							"status",
-							[],
-							(state) => buildContext({ state, programId: consensusInst.programId }),
-						);
-						if ((status as any)?.authNonces?.includes(auth.nonce)) {
-							res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-							res.end(JSON.stringify({ valid: false, error: "nonce already consumed" }));
-							return;
-						}
-					}
-
+					// TODO(autobase): re-add x402 nonce replay protection at the
+					// auction-layer indexer once Phase 2 lands.
 					res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
 					res.end(JSON.stringify({ valid: true }));
 				} catch (err: any) {

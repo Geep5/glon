@@ -161,8 +161,6 @@ describe("wallet signing", () => {
 		const result = doSignChange({
 			name: "alice",
 			changeB64: Buffer.from(encoded).toString("base64"),
-			nonce: 1,
-			fee: 10,
 		}, tmpPath);
 
 		assert.equal(result.pubkey, r.pubkey);
@@ -174,8 +172,6 @@ describe("wallet signing", () => {
 		const sig = decodeSignature(signed.authExtension.payload);
 		assert.equal(sig.signature.length, 64);
 		assert.equal(hexEncode(sig.pubkey), r.pubkey);
-		assert.equal(sig.nonce, 1);
-		assert.equal(sig.fee, 10);
 
 		const signingBytes = canonicalEncodeChangeForSigning(signed);
 		const ok = ed25519Verify(sig.pubkey, signingBytes, sig.signature);
@@ -191,28 +187,7 @@ describe("wallet signing", () => {
 		assert.throws(() => doSignChange({
 			name: "nobody",
 			changeB64: Buffer.from(encodeChange(ch)).toString("base64"),
-			nonce: 1, fee: 0,
 		}, tmpPath), /no key named/);
-	});
-
-	it("signChange rejects nonce < 1", () => {
-		doNew("alice", 1, tmpPath);
-		const ch = unsignedChange("obj-1", "chain.coin.bucket");
-		assert.throws(() => doSignChange({
-			name: "alice",
-			changeB64: Buffer.from(encodeChange(ch)).toString("base64"),
-			nonce: 0, fee: 0,
-		}, tmpPath), /nonce/);
-	});
-
-	it("signChange rejects negative fee", () => {
-		doNew("alice", 1, tmpPath);
-		const ch = unsignedChange("obj-1", "chain.coin.bucket");
-		assert.throws(() => doSignChange({
-			name: "alice",
-			changeB64: Buffer.from(encodeChange(ch)).toString("base64"),
-			nonce: 1, fee: -1,
-		}, tmpPath), /fee/);
 	});
 
 	it("two distinct keys produce independently verifiable signatures", () => {
@@ -221,8 +196,8 @@ describe("wallet signing", () => {
 		const ch = unsignedChange("obj-1", "chain.coin.bucket");
 		const encoded = Buffer.from(encodeChange(ch)).toString("base64");
 
-		const aliceSig = doSignChange({ name: "alice", changeB64: encoded, nonce: 1, fee: 0 }, tmpPath);
-		const bobSig = doSignChange({ name: "bob", changeB64: encoded, nonce: 1, fee: 0 }, tmpPath);
+		const aliceSig = doSignChange({ name: "alice", changeB64: encoded }, tmpPath);
+		const bobSig = doSignChange({ name: "bob", changeB64: encoded }, tmpPath);
 
 		assert.notEqual(aliceSig.pubkey, bobSig.pubkey);
 		assert.notEqual(aliceSig.id, bobSig.id, "different signers → different ids");
@@ -257,8 +232,6 @@ describe("wallet signing", () => {
 		const result = doSignChange({
 			name: "alice",
 			changeB64: Buffer.from(encodeChange(ch)).toString("base64"),
-			nonce: 5,
-			fee: 100,
 		}, tmpPath);
 		const signed = decodeChange(new Uint8Array(Buffer.from(result.changeB64, "base64")));
 		assert.equal(signed.objectId, "obj-7");
