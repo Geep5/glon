@@ -163,6 +163,23 @@ If `topics_joined` is 0, run the manual join command above.
 | `GLON_DISPATCH_PORT` | 6430 | Daemon dispatch port |
 | `GLON_DATA` | `~/.glon` | Data directory |
 
+## Auction Modes
+
+Auctions are a single primitive — what the seller fills in determines the behavior. The apply function detects the mode at op time:
+
+| `give` | `want` (asking price) | `recipient_pubkey` | Mode | Settlement |
+|---|---|---|---|---|
+| ✓ | ✓ | unset | **Fixed-price** | Anyone can bid; seller picks a winner via `--bid-at`; default payment is `want` |
+| ✓ | unset | unset | **Open auction** | Anyone can bid with any token / basket; seller MUST pass `--bid-at` to pick which bid |
+| ✓ | unset | ✓ | **Gift** | **Auto-settles atomically on creation** — single op, no separate settle needed |
+| ✓ | ✓ | ✓ | **Directed sale (private)** | Only the named recipient is intended; seller still settles manually |
+
+Key invariants:
+- Every auction must have an `expiry_ms > created_at`. Apply rejects auctions that would be born expired.
+- Late ops (`bid` / `settle` / `cancel` arriving after `expiry_ms`) lazy-expire the auction: seller is refunded, the late op is dropped.
+- Open auctions REQUIRE `--bid-at` on settle (the seller picks which of the received bids wins). Apply stamps `invalid_open_settle_needs_bid` if you forget.
+- Settling a fixed-price auction can optionally pass `--bid-at` to accept a **counter-offer** in different tokens than the posted `want`.
+
 ## Holistic Two-Daemon Auction House Test
 
 This walks two glon nodes (running on the same machine for simplicity) through deploy → gift → bid → settle, exercising the full auction-house stack with **real balance tracking** on the autobase.
@@ -205,7 +222,7 @@ Then in B's CLI:
 /coin list                                       # should show Figgies (replicated from A)
 ```
 
-### Alice gifts Bob some FIG (auction with recipient + empty want)
+### Alice gifts Bob some FIG (single op, atomic transfer)
 
 In Terminal 1:
 
@@ -213,11 +230,13 @@ In Terminal 1:
 /auction gift 100 <FIG token_id> to <bob pubkey> with alice
 ```
 
-In Terminal 2, after a few seconds:
+Gifts **auto-settle on creation** — the recipient's balance updates in the same apply pass that creates the auction record. No separate settle step. In Terminal 2, after replication:
 
 ```
 /coin balance <FIG token_id> <bob pubkey>        # should print 100
 ```
+
+The auction record stays in the AH ledger (`status: settled`, `auto_settled_gift: true`) so every gift leaves an auditable trail.
 
 ### Trade — Bob auctions an item, Alice buys it
 
@@ -235,11 +254,13 @@ In Terminal 1:
 /auction bid <auctionId> 50 <FIG token_id> with alice
 ```
 
-In Terminal 2:
+In Terminal 2 (settle the fixed-price auction; `--bid-at` is optional since the payment matches the posted `want`):
 
 ```
 /auction settle <auctionId> <alice pubkey> with bob
 ```
+
+> For **open auctions** (no `for`), the seller must pass `--bid-at=<bid created_at ms>` to pick which of the received bids to honor. Get the timestamps via `curl -s http://127.0.0.1:4173/api/auctions/<id>/bids`. The Astrolabe UI's per-bid Accept button does this for you in one click.
 
 Both terminals:
 
@@ -251,14 +272,42 @@ Both terminals:
 
 The settle propagates over Hyperswarm replication; both nodes' apply functions deterministically debit Alice's 50 FIG and credit Bob's. **Same state on both ends, no leader, no consensus protocol.**
 
-## Astrolabe Auctions Panel
+## Astrolabe UI — the auction house, no CLI needed
 
-When the daemon is running with `GLON_AUCTION=1`, the Astrolabe UI at `http://127.0.0.1:4173` exposes:
-- **Auctions panel** (spell-bar slot "A") — live list of all auctions in the autobase view; shows status badges (open / settled / cancelled / invalid_*) and a cancel button for your own open auctions.
-- **`GET /api/auctions`** — JSON list for headless consumers.
-- **`GET /api/auction/status`** — local ledger health (bootstrap key, writer key, view length).
-- **`GET /api/coins`** — all deployed tokens.
-- **`GET /api/coins/:id/holders`** — top holders descending.
+When the daemon is running with `GLON_SWARM=1 GLON_AUCTION=1`, http://127.0.0.1:4173 exposes the full auction-house surface as a UI:
+
+### 3D scene
+- A **cyan octahedron** orbits near the local sun. That's the auction house. Hover for tooltip; click to fly the camera in and pop the panel open.
+- Clicking any row in the **Coins** panel also tweens the camera to the auction-house node — coins "live" at the AH.
+
+### Auctions panel (spell-bar slot `A`)
+- Live list of auctions from the autobase view, sorted open → settled → cancelled → expired.
+- Each row shows give → want, status badge, expiry countdown (`in 23h 45m`), and (for your own auctions) a cyan **"you"** badge with a left-border highlight.
+- **`+ post auction`** opens an inline form. Live mode chip tells you which mode you're about to create (open / gift / fixed / directed) based on whether `asking price` and `directed to` are filled.
+- **`+ bid`** (per row, only on others' auctions) — inline mini-form: offer `<amount> <token_id>` + signing key, submit.
+- **`▸ bids`** (per open row) — expands the bid list inline. Shows bidder, offer basket, age. For your own auctions, each bid has a cyan **accept** button that fires `auction.settle` with the right `winning_bid_at`. One click settles to that specific bidder.
+- **`cancel`** (per row, only on your own open auctions) — closes the auction; escrowed assets refund to you immediately.
+
+### Coins panel (spell-bar slot `4`)
+- All tokens deployed on this network. Each row shows name, symbol, supply, mint-renounced state, and the top 4 holders (with `(owner)` tag for the original deployer).
+- Click any row → flies camera to the AH and opens its panel ("this is where these coins move").
+
+### API surface (proxied to the daemon's `/dispatch`)
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/auction/status` | local ledger health (bootstrap key, writer key, view length) |
+| `GET /api/auctions` | all auctions in the local view |
+| `GET /api/auctions/:id` | one auction's full record (incl. status, escrow flags, settle details) |
+| `GET /api/auctions/:id/bids` | all bids on an auction, newest first |
+| `POST /api/auctions/post` | `{ give, want, recipient?, expiryMs, keyName }` |
+| `POST /api/auctions/gift` | shorthand for directed + empty-want post |
+| `POST /api/auctions/bid` | `{ auctionId, offer, keyName }` |
+| `POST /api/auctions/settle` | `{ auctionId, winner, winningBidAt?, keyName }` |
+| `POST /api/auctions/cancel` | `{ auctionId, keyName }` |
+| `GET /api/coins` | all deployed tokens |
+| `GET /api/coins/:id/holders` | top holders descending |
+| `GET /api/wallet` | local chain pubkeys (used by the UI for "is this mine?" checks) |
 
 
 ## Health Checks
