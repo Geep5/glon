@@ -23,7 +23,7 @@ import {
 	initAutobase,
 	isWritable,
 	type JoinOp,
-} from "../src/autobase-host.ts";
+} from "../src/ledger-host.ts";
 import { generateKeyPair, sign as ed25519Sign } from "../src/det/ed25519.ts";
 import { hexEncode } from "../src/crypto.ts";
 

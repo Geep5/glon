@@ -20,7 +20,7 @@ import Autobase from "autobase";
 import Hyperbee from "hyperbee";
 import Hyperswarm from "hyperswarm";
 import createTestnet from "hyperdht/testnet.js";
-import { apply, canonicalSigningBytes, type AuctionCreateOp } from "../src/autobase-host.ts";
+import { apply, canonicalSigningBytes, type AuctionCreateOp } from "../src/ledger-host.ts";
 import { generateKeyPair, sign as ed25519Sign } from "../src/det/ed25519.ts";
 import { hexEncode } from "../src/crypto.ts";
 

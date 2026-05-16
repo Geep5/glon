@@ -1,7 +1,7 @@
 // /auction — decentralized auction house over a permissionless autobase.
 //
 // Posts auctions / bids / settlements / cancellations to the local
-// writer hypercore. The autobase apply function (in src/autobase-host.ts)
+// writer hypercore. The apply function (in src/ledger-host.ts)
 // linearizes them with everyone else's ops and enforces conservation in
 // the hyperbee view.
 //
@@ -22,6 +22,10 @@ import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js"
 import { registerActorContentHandler } from "../runtime.js";
 import { dim, bold, cyan, green, red, yellow } from "../shared.js";
 import { sha256, hexEncode } from "../../crypto.js";
+// Static import — goes through the runtime externals shim. Dynamic `import()`
+// here would try to resolve the path against the bundled program's directory
+// and fail with "Cannot find module".
+import { isReady as swarmIsReady, topicFor as swarmTopicFor } from "../../swarm-host.js";
 import {
 	appendOp,
 	viewGet,
@@ -37,7 +41,7 @@ import {
 	type AuctionCancelOp,
 	type AuctionAsset,
 	type JoinOp,
-} from "../../autobase-host.js";
+} from "../../ledger-host.js";
 import { randomUUID } from "node:crypto";
 
 // ── Auto-join over Hyperswarm directory topic ────────────────────
@@ -55,7 +59,7 @@ function requireAutobase(): void {
 }
 
 /** Build the canonical bytes for signing: keys sorted, `signature` and
- *  `id` stripped. Must match autobase-host.canonicalSigningBytes exactly. */
+ *  `id` stripped. Must match ledger-host.canonicalSigningBytes exactly. */
 function canonicalSigningBytes(op: Record<string, unknown>): Uint8Array {
 	const copy: Record<string, unknown> = {};
 	for (const k of Object.keys(op).sort()) {
@@ -251,8 +255,7 @@ async function broadcastJoinAnnounce(ctx: ProgramContext): Promise<{ broadcast: 
 	if (!autobaseReady()) return { broadcast: false, reason: "autobase not ready" };
 	if (isWritable()) return { broadcast: false, reason: "already a writer" };
 
-	const swarmHost = await import("../../swarm-host.js");
-	if (!swarmHost.isReady()) return { broadcast: false, reason: "swarm not ready" };
+	if (!swarmIsReady()) return { broadcast: false, reason: "swarm not ready" };
 
 	let announcement: JoinOp & { signature: string };
 	try {
@@ -261,7 +264,7 @@ async function broadcastJoinAnnounce(ctx: ProgramContext): Promise<{ broadcast: 
 		return { broadcast: false, reason: err?.message ?? "no wallet key 'default' yet" };
 	}
 
-	const topicHex = swarmHost.topicFor(JOIN_TOPIC_LABEL).toString("hex");
+	const topicHex = swarmTopicFor(JOIN_TOPIC_LABEL).toString("hex");
 	const payload_b64 = Buffer.from(JSON.stringify(announcement)).toString("base64");
 	try {
 		await ctx.dispatchProgram("/transport-hyperswarm", "broadcast", [{

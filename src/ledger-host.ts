@@ -1,28 +1,35 @@
 /**
- * autobase-host — daemon-side ownership of the auction-house autobase.
+ * ledger-host — daemon-side ownership of the auction-house ledger.
  *
- * Why this module exists: same reason as swarm-host. corestore/autobase/
- * hyperbee pull in native deps (sodium-native at minimum) that esbuild
- * can't bundle into a string-evaluated program. The daemon owns the
- * autobase instance and exposes a tiny API surface through runtime
- * externals so bundled programs (`/auction`) can read/write the log.
+ * Why this module exists: corestore / autobase / hyperbee pull in native
+ * deps (sodium-native at minimum) that esbuild can't bundle into a
+ * string-evaluated program. The daemon owns the ledger instance and
+ * exposes a tiny API surface through runtime externals so bundled
+ * programs (`/auction`, `/coin`) can read/write it.
  *
- * Programs that need autobase access import like:
+ * Programs that need ledger access import like:
  *
- *   import { appendOp, getView, getWriterPubkeyHex } from "../autobase-host.js";
+ *   import { appendOp, viewGet, getWriterPubkeyHex } from "../ledger-host.js";
  *
- * The bundler resolves "autobase-host.js" to this module's exports via
+ * The bundler resolves "ledger-host.js" to this module's exports via
  * the runtime externals map.
  *
- * Threading & state: everything lives on the Node event loop. Autobase
- * runs `apply` whenever new nodes arrive; we install a single apply
- * function that dispatches op-kind → handler.
+ * Two backends share this module's API:
  *
- * Persistence: `~/.glon/autobase/` holds the corestore. The autobase
- * bootstrap key is generated once (first run) and persisted; subsequent
- * starts load the same base. When/if we want a canonical glon-mainnet
- * later, the founder commits their bootstrap pubkey to `src/genesis.ts`
- * and clients pass it via env to bootstrap from there.
+ *   "autobase" — the original implementation. Single autobase with a
+ *                writer set. Existing writers must admit new writers via
+ *                peer.join ops. Persistent storage at ~/.glon/autobase/.
+ *
+ *   "raw"      — pure CRDT over a corestore of writer hypercores. No
+ *                writer set, no admission, no whitelist. Every node has
+ *                its own writer hypercore; nodes deterministically merge
+ *                all known writers' ops by (created_at, writer_pubkey,
+ *                seq) and run apply over the result. isWritable() is
+ *                always true. Persistent storage at ~/.glon/ledger/.
+ *
+ * The daemon picks the backend at init based on GLON_RAW_LEDGER env.
+ * Programs are backend-agnostic — they call appendOp / viewGet / etc.
+ * and the right implementation runs.
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
@@ -179,25 +186,57 @@ export interface AuctionAsset {
 	amount?: string;                // decimal string for fungible
 }
 
-// ── Singleton state ───────────────────────────────────────────────
+// ── Singleton state (two-backend) ─────────────────────────────────
 
 interface AutobaseInstance {
-	base: any;                      // Autobase instance — typed via structural minimum below
+	backend: "autobase";
+	base: any;                      // Autobase instance
 	view: any;                      // Hyperbee
 	corestore: any;
 	writerPubkey: Buffer;
 }
 
-let singleton: AutobaseInstance | null = null;
+interface RawInstance {
+	backend: "raw";
+	corestore: any;                 // Corestore (owns all writer hypercores)
+	localCore: any;                 // This node's writer hypercore
+	knownWriters: Map<string, any>; // pubkey_hex → peer's hypercore
+	view: Map<string, string>;      // In-memory key/value view; rebuilt on replay
+	highestSeenTs: number;          // Fast-path: skip replay when new op's ts > this
+	registryFile: string;           // Where peer pubkeys are persisted across restarts
+	reapplyTimer: ReturnType<typeof setTimeout> | null;
+	reapplyInFlight: Promise<void> | null;
+	storageDir: string;             // ~/.glon/ledger (or override) — for status / debugging
+}
 
-function require_(): AutobaseInstance {
+type LedgerInstance = AutobaseInstance | RawInstance;
+
+let singleton: LedgerInstance | null = null;
+
+function require_(): LedgerInstance {
 	if (!singleton) {
-		throw new Error("autobase-host: initAutobase() has not been called yet");
+		throw new Error("ledger-host: not initialized — call initAutobase() or initRawLedger()");
 	}
 	return singleton;
 }
 
+function requireAutobase(): AutobaseInstance {
+	const s = require_();
+	if (s.backend !== "autobase") throw new Error("ledger-host: this call requires the autobase backend");
+	return s;
+}
+
+function requireRaw(): RawInstance {
+	const s = require_();
+	if (s.backend !== "raw") throw new Error("ledger-host: this call requires the raw backend");
+	return s;
+}
+
 export function isReady(): boolean { return singleton != null; }
+
+export function backendName(): "autobase" | "raw" | "none" {
+	return singleton?.backend ?? "none";
+}
 
 // ── Storage paths ─────────────────────────────────────────────────
 
@@ -235,55 +274,80 @@ function writePersistedBootstrap(key: Buffer): void {
 
 // ── Public API used by programs (through runtime externals) ─────
 
-/** Append an op to the local writer hypercore. Returns when the autobase
- *  has applied it locally (view reflects the change). Throws if autobase
- *  isn't initialized or if the underlying append fails. */
+/** Append an op to the local writer. Returns when the view reflects the
+ *  change (autobase: apply has run; raw: incremental or full replay has
+ *  applied the new op locally). */
 export async function appendOp(op: AuctionOp): Promise<void> {
 	const inst = require_();
-	await inst.base.append(JSON.stringify(op));
-	// `update()` is idempotent; it gives apply a chance to run.
-	await inst.base.update();
+	if (inst.backend === "autobase") {
+		await inst.base.append(JSON.stringify(op));
+		await inst.base.update();
+	} else {
+		await rawAppendAndApply(inst, op);
+	}
 }
 
-/** Read a key from the hyperbee view. Returns parsed JSON or null. */
+/** Read a key from the view. Returns parsed JSON or null. */
 export async function viewGet<T = unknown>(key: string): Promise<T | null> {
 	const inst = require_();
-	const node = await inst.view.get(key);
-	if (!node) return null;
-	const raw = node.value;
-	if (raw == null) return null;
-	const s = typeof raw === "string" ? raw : raw.toString("utf-8");
-	try { return JSON.parse(s) as T; } catch { return null; }
+	if (inst.backend === "autobase") {
+		const node = await inst.view.get(key);
+		if (!node) return null;
+		const raw = node.value;
+		if (raw == null) return null;
+		const s = typeof raw === "string" ? raw : raw.toString("utf-8");
+		try { return JSON.parse(s) as T; } catch { return null; }
+	} else {
+		const v = inst.view.get(key);
+		if (v === undefined) return null;
+		try { return JSON.parse(v) as T; } catch { return null; }
+	}
 }
 
-/** Iterate keys with a given prefix (e.g. "auction/") — returns an array
- *  for simplicity at MVP scale. Switch to async iterator if we ever care
- *  about large auction-list pagination. */
+/** Iterate keys with a given prefix (e.g. "auction/"). */
 export async function viewList<T = unknown>(prefix: string): Promise<Array<{ key: string; value: T }>> {
 	const inst = require_();
 	const out: Array<{ key: string; value: T }> = [];
-	const upper = prefix + "￿";
-	const stream = inst.view.createReadStream({ gte: prefix, lt: upper });
-	for await (const node of stream) {
-		const raw = node.value;
-		const s = typeof raw === "string" ? raw : raw.toString("utf-8");
-		try { out.push({ key: node.key.toString("utf-8"), value: JSON.parse(s) as T }); } catch { /* skip malformed */ }
+	if (inst.backend === "autobase") {
+		const upper = prefix + "￿";
+		const stream = inst.view.createReadStream({ gte: prefix, lt: upper });
+		for await (const node of stream) {
+			const raw = node.value;
+			const s = typeof raw === "string" ? raw : raw.toString("utf-8");
+			try { out.push({ key: node.key.toString("utf-8"), value: JSON.parse(s) as T }); } catch { /* skip */ }
+		}
+	} else {
+		const upper = prefix + "￿";
+		const keys = [...inst.view.keys()].filter((k) => k >= prefix && k < upper).sort();
+		for (const k of keys) {
+			const v = inst.view.get(k);
+			if (v === undefined) continue;
+			try { out.push({ key: k, value: JSON.parse(v) as T }); } catch { /* skip */ }
+		}
 	}
 	return out;
 }
 
 export function getWriterPubkeyHex(): string {
-	return require_().writerPubkey.toString("hex");
+	const inst = require_();
+	if (inst.backend === "autobase") return inst.writerPubkey.toString("hex");
+	return inst.localCore.key.toString("hex");
 }
 
-/** Whether this node's autobase writer has been admitted (can append ops). */
+/** Whether this node can append ops. Autobase: true once admitted as a
+ *  writer. Raw: always true (every node owns its own writer hypercore
+ *  with no admission step). */
 export function isWritable(): boolean {
 	if (!singleton) return false;
-	return singleton.base.writable === true;
+	if (singleton.backend === "autobase") return singleton.base.writable === true;
+	return true;
 }
 
 export function getBootstrapKeyHex(): string {
-	return require_().base.key.toString("hex");
+	const inst = require_();
+	if (inst.backend === "autobase") return inst.base.key.toString("hex");
+	// Raw ledger has no bootstrap key — network identity is the topic, not a key.
+	return "";
 }
 
 export function statusSnapshot(): {
@@ -291,15 +355,29 @@ export function statusSnapshot(): {
 	writer_pubkey: string;
 	view_length: number;
 	system_length: number;
+	backend?: string;
+	known_writers?: number;
 } {
 	if (!singleton) {
 		return { bootstrap_key: "", writer_pubkey: "", view_length: 0, system_length: 0 };
 	}
+	if (singleton.backend === "autobase") {
+		return {
+			backend: "autobase",
+			bootstrap_key: singleton.base.key.toString("hex"),
+			writer_pubkey: singleton.writerPubkey.toString("hex"),
+			view_length: singleton.view?.feed?.length ?? 0,
+			system_length: singleton.base.length ?? 0,
+		};
+	}
+	// Raw backend
 	return {
-		bootstrap_key: singleton.base.key.toString("hex"),
-		writer_pubkey: singleton.writerPubkey.toString("hex"),
-		view_length: singleton.view?.feed?.length ?? 0,
-		system_length: singleton.base.length ?? 0,
+		backend: "raw",
+		bootstrap_key: "",   // no bootstrap key — topic-based network
+		writer_pubkey: singleton.localCore.key.toString("hex"),
+		view_length: singleton.view.size,
+		system_length: singleton.localCore.length ?? 0,
+		known_writers: singleton.knownWriters.size + 1,  // +1 for our local writer
 	};
 }
 
@@ -319,8 +397,9 @@ export interface InitOpts {
 }
 
 export function initAutobase(opts: InitOpts): void {
-	if (singleton) throw new Error("autobase-host: already initialized");
+	if (singleton) throw new Error("ledger-host: already initialized");
 	singleton = {
+		backend: "autobase",
 		base: opts.autobase,
 		view: opts.view,
 		corestore: opts.corestore,
@@ -330,8 +409,17 @@ export function initAutobase(opts: InitOpts): void {
 
 export async function shutdown(): Promise<void> {
 	if (!singleton) return;
-	try { await singleton.base.close(); } catch { /* best effort */ }
-	try { await singleton.corestore.close(); } catch { /* best effort */ }
+	if (singleton.backend === "autobase") {
+		try { await singleton.base.close(); } catch { /* best effort */ }
+		try { await singleton.corestore.close(); } catch { /* best effort */ }
+	} else {
+		if (singleton.reapplyTimer) clearTimeout(singleton.reapplyTimer);
+		try { await singleton.localCore.close(); } catch { /* best effort */ }
+		for (const core of singleton.knownWriters.values()) {
+			try { await core.close(); } catch { /* best effort */ }
+		}
+		try { await singleton.corestore.close(); } catch { /* best effort */ }
+	}
 	singleton = null;
 }
 
@@ -806,4 +894,254 @@ export function persistBootstrap(key: Buffer): void {
 /** Where the corestore lives on disk. Daemon needs this to construct Corestore. */
 export function getCorestoreDir(): string {
 	return corestoreDir();
+}
+
+// ══════════════════════════════════════════════════════════════════
+// RAW BACKEND — multi-writer CRDT over raw hypercores, no autobase.
+// ══════════════════════════════════════════════════════════════════
+//
+// Each node has its own writer hypercore. Other writers' cores are
+// discovered (eventually, by Phase 2's swarm layer) and added to the
+// local corestore for replication. The view is computed by sorting all
+// known writers' ops by (created_at, writer_pubkey_hex, seq) and
+// running the existing `apply()` function over that ordered stream.
+//
+// Persistence:
+//   ~/.glon/ledger/corestore/   — all hypercores (mine + replicated peers')
+//   ~/.glon/ledger/peers.json   — array of known peer writer pubkeys (hex)
+//
+// The view is in-memory only. It's rebuilt from the hypercores on every
+// cold start. Losing the view on crash is fine — the hypercores are the
+// source of truth.
+
+function rawStorageDir(): string {
+	return process.env.GLON_LEDGER_DIR ?? join(homedir(), ".glon", "ledger");
+}
+
+function rawCorestoreDir(): string {
+	return join(rawStorageDir(), "corestore");
+}
+
+function rawRegistryFile(): string {
+	return join(rawStorageDir(), "peers.json");
+}
+
+function loadPeerRegistry(): string[] {
+	const p = rawRegistryFile();
+	if (!existsSync(p)) return [];
+	try {
+		const parsed = JSON.parse(readFileSync(p, "utf-8"));
+		return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+	} catch { return []; }
+}
+
+function savePeerRegistry(peers: string[]): void {
+	mkdirSync(rawStorageDir(), { recursive: true });
+	writeFileSync(rawRegistryFile(), JSON.stringify(peers, null, 2));
+}
+
+export interface InitRawOpts {
+	corestore: any;     // Constructed Corestore, ready()-ed
+	localCore: any;     // The local writer hypercore (already ready())
+	knownWriters?: string[];  // Optional list of peer pubkey hexes to load
+}
+
+/** Initialize the raw multi-writer backend. Daemon calls this when
+ *  GLON_RAW_LEDGER=1. After this call, the public API (appendOp,
+ *  viewGet, etc.) operates in raw mode. */
+export async function initRawLedger(opts: InitRawOpts): Promise<void> {
+	if (singleton) throw new Error("ledger-host: already initialized");
+	const knownWritersList = opts.knownWriters ?? loadPeerRegistry();
+	const knownWriters = new Map<string, any>();
+	for (const hex of knownWritersList) {
+		if (!/^[0-9a-fA-F]{64}$/.test(hex)) continue;
+		try {
+			const core = opts.corestore.get({ key: Buffer.from(hex, "hex") });
+			await core.ready();
+			knownWriters.set(hex.toLowerCase(), core);
+		} catch (err: any) {
+			console.warn(`[ledger-host:raw] couldn't open peer core ${hex.slice(0, 12)}…: ${err?.message ?? err}`);
+		}
+	}
+	const inst: RawInstance = {
+		backend: "raw",
+		corestore: opts.corestore,
+		localCore: opts.localCore,
+		knownWriters,
+		view: new Map<string, string>(),
+		highestSeenTs: 0,
+		registryFile: rawRegistryFile(),
+		reapplyTimer: null,
+		reapplyInFlight: null,
+		storageDir: rawStorageDir(),
+	};
+	singleton = inst;
+	// Subscribe to local core appends + each peer core's appends so we
+	// know when to re-apply.
+	const wireAppendListener = (core: any) => {
+		core.on("append", () => scheduleReapply(inst));
+	};
+	wireAppendListener(opts.localCore);
+	for (const core of knownWriters.values()) wireAppendListener(core);
+	// Initial replay to populate view from on-disk state.
+	await rawRunFullReplay(inst);
+}
+
+/** Add a peer's writer hypercore to the replication set. Daemon's swarm
+ *  layer (Phase 2) calls this when it discovers a new writer. The peer
+ *  is persisted to disk so we keep replicating it across daemon restarts. */
+export async function addKnownWriter(pubkeyHex: string): Promise<void> {
+	const inst = requireRaw();
+	pubkeyHex = pubkeyHex.toLowerCase();
+	if (!/^[0-9a-fA-F]{64}$/.test(pubkeyHex)) throw new Error("invalid pubkey");
+	if (inst.knownWriters.has(pubkeyHex)) return;
+	const core = inst.corestore.get({ key: Buffer.from(pubkeyHex, "hex") });
+	await core.ready();
+	core.on("append", () => scheduleReapply(inst));
+	inst.knownWriters.set(pubkeyHex, core);
+	// Persist.
+	const list = [...inst.knownWriters.keys()];
+	savePeerRegistry(list);
+	scheduleReapply(inst);
+}
+
+/** Append op to local writer, then either apply incrementally (fast path)
+ *  or trigger a full replay (slow path, reorg). */
+async function rawAppendAndApply(inst: RawInstance, op: AuctionOp): Promise<void> {
+	const ts = (op as any).created_at ?? 0;
+	await inst.localCore.append(JSON.stringify(op));
+	if (ts > inst.highestSeenTs) {
+		// Fast path — strictly newer than everything we've applied; just
+		// apply this single op on top of the current view.
+		await rawApplySingle(inst, op);
+		inst.highestSeenTs = ts;
+	} else {
+		// Slow path — reorg required. Do a full replay so this op lands
+		// at its correct position relative to existing ops.
+		await rawRunFullReplay(inst);
+	}
+}
+
+/** Apply one op against the current view, without touching state from
+ *  other writers. Caller is responsible for ordering guarantees (fast
+ *  path only). */
+async function rawApplySingle(inst: RawInstance, op: AuctionOp): Promise<void> {
+	const viewShim = makeMapViewShim(inst.view);
+	const hostShim = makeNoopHostShim();
+	const node = { value: JSON.stringify(op), from: { key: inst.localCore.key } };
+	await apply([node], viewShim, hostShim);
+}
+
+/** Collect all ops from every writer hypercore, sort deterministically,
+ *  clear the view, and re-run apply from scratch. Called on cold start
+ *  and on any reorg (out-of-order op or new peer writer joined). */
+async function rawRunFullReplay(inst: RawInstance): Promise<void> {
+	if (inst.reapplyInFlight) {
+		// Coalesce: there's already a replay running. Caller can await
+		// the existing promise. We schedule one more just in case there
+		// were appends between the current pass and now.
+		await inst.reapplyInFlight;
+		return;
+	}
+	inst.reapplyInFlight = (async () => {
+		const ops: Array<{ op: AuctionOp; writerHex: string; seq: number }> = [];
+		const cores: Array<[string, any]> = [
+			[inst.localCore.key.toString("hex").toLowerCase(), inst.localCore],
+			...inst.knownWriters,
+		];
+		for (const [hex, core] of cores) {
+			const len = core.length ?? 0;
+			for (let i = 0; i < len; i++) {
+				let block;
+				try { block = await core.get(i); } catch { continue; }
+				if (!block) continue;
+				const s = typeof block === "string" ? block : block.toString("utf-8");
+				let op: AuctionOp;
+				try { op = JSON.parse(s) as AuctionOp; } catch { continue; }
+				ops.push({ op, writerHex: hex, seq: i });
+			}
+		}
+		// Deterministic ordering: timestamp first, then writer pubkey lex,
+		// then sequence inside that writer.
+		ops.sort((a, b) => {
+			const ta = (a.op as any).created_at ?? 0;
+			const tb = (b.op as any).created_at ?? 0;
+			if (ta !== tb) return ta - tb;
+			if (a.writerHex !== b.writerHex) return a.writerHex < b.writerHex ? -1 : 1;
+			return a.seq - b.seq;
+		});
+		// Reset view + replay.
+		inst.view.clear();
+		inst.highestSeenTs = 0;
+		const viewShim = makeMapViewShim(inst.view);
+		const hostShim = makeNoopHostShim();
+		const nodes = ops.map((o) => ({
+			value: JSON.stringify(o.op),
+			from: { key: Buffer.from(o.writerHex, "hex") },
+		}));
+		await apply(nodes, viewShim, hostShim);
+		// Recompute highestSeenTs.
+		for (const o of ops) {
+			const t = (o.op as any).created_at ?? 0;
+			if (t > inst.highestSeenTs) inst.highestSeenTs = t;
+		}
+	})();
+	try {
+		await inst.reapplyInFlight;
+	} finally {
+		inst.reapplyInFlight = null;
+	}
+}
+
+/** Debounced re-apply scheduler. Multiple triggers within 50ms coalesce
+ *  into one full replay. */
+function scheduleReapply(inst: RawInstance): void {
+	if (inst.reapplyTimer) return;
+	inst.reapplyTimer = setTimeout(() => {
+		inst.reapplyTimer = null;
+		rawRunFullReplay(inst).catch((err: any) => {
+			console.error(`[ledger-host:raw] reapply failed: ${err?.message ?? err}`);
+		});
+	}, 50);
+}
+
+/** Hyperbee-shape proxy backed by a JS Map. Lets the existing apply()
+ *  function work without any modification. */
+function makeMapViewShim(map: Map<string, string>): any {
+	return {
+		async get(key: string) {
+			const v = map.get(key);
+			return v === undefined ? null : { key, value: v };
+		},
+		async put(key: string, value: any) {
+			const s = typeof value === "string" ? value : value.toString("utf-8");
+			map.set(key, s);
+		},
+		async del(key: string) {
+			map.delete(key);
+		},
+		createReadStream(opts: { gte: string; lt?: string }) {
+			const { gte, lt } = opts;
+			const keys = [...map.keys()].filter((k) => k >= gte && (!lt || k < lt)).sort();
+			async function* gen() {
+				for (const k of keys) yield { key: k, value: map.get(k)! };
+			}
+			return gen();
+		},
+	};
+}
+
+/** Apply expects a `host` arg with addWriter/ackWriter for the autobase
+ *  flow. In raw mode there's no writer set, so these are no-ops. */
+function makeNoopHostShim(): any {
+	return {
+		async addWriter(_key: Buffer, _opts?: any) { /* noop */ },
+		async ackWriter(_key: Buffer) { /* noop */ },
+		async removeWriter(_key: Buffer) { /* noop */ },
+	};
+}
+
+/** Helper for daemon: where the raw corestore lives on disk. */
+export function getRawCorestoreDir(): string {
+	return rawCorestoreDir();
 }

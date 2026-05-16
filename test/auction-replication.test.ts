@@ -8,7 +8,7 @@
 //      both sides (the CRDT property).
 //
 // No Hyperswarm involved — this exercises the autobase merge logic and
-// the apply function in src/autobase-host.ts directly. The real-network
+// the apply function in src/ledger-host.ts directly. The real-network
 // integration test will use Hyperswarm in a separate file.
 
 import { describe, it, after } from "node:test";
@@ -19,7 +19,7 @@ import { join } from "node:path";
 import Corestore from "corestore";
 import Autobase from "autobase";
 import Hyperbee from "hyperbee";
-import { apply, canonicalSigningBytes, type AuctionCreateOp } from "../src/autobase-host.ts";
+import { apply, canonicalSigningBytes, type AuctionCreateOp } from "../src/ledger-host.ts";
 import { generateKeyPair, sign as ed25519Sign } from "../src/det/ed25519.ts";
 import { hexEncode } from "../src/crypto.ts";
 

@@ -14,7 +14,7 @@
 //   coin info     → hyperbee read of token entry
 //
 // Signatures are Ed25519 over the canonical-sorted JSON of the op without
-// `signature`. Apply verifies in autobase-host.verifyOpSignature.
+// `signature`. Apply verifies in ledger-host.verifyOpSignature.
 //
 // Token ids are content-addressed: sha256(canonical(coin.deploy op without
 // id/signature)) — same scheme as auction ids. Stable across nodes.
@@ -32,7 +32,7 @@ import {
 	type CoinMintOp,
 	type CoinTransferOp,
 	type CoinBurnOp,
-} from "../../autobase-host.js";
+} from "../../ledger-host.js";
 
 // ── Helpers ──────────────────────────────────────────────────────
 

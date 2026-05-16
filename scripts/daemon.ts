@@ -119,23 +119,43 @@ async function resolveId(raw: string): Promise<string | null> {
 			}
 		}
 
-		// ── Autobase bring-up (Phase 2 — auction-house ledger) ────
-		// Opt-in via GLON_AUCTION=1 until /auction is fully stitched in.
-		// Replication over Hyperswarm wires in once both are running.
+		// ── Ledger bring-up ──────────────────────────────────────
+		// Opt-in via GLON_AUCTION=1. Backend is the autobase (default)
+		// OR the raw multi-writer CRDT (if GLON_RAW_LEDGER=1). Raw mode
+		// has no writer set / no admission and isWritable() is always
+		// true; autobase mode keeps the legacy admission flow.
 		if (process.env.GLON_AUCTION === "1") {
-			try {
+			if (process.env.GLON_RAW_LEDGER === "1") {
+				// ── Raw multi-writer backend ─────────────────────
+				try {
+					const { default: Corestore } = await import("corestore");
+					const ledger = await import("../src/ledger-host.js");
+
+					const corestore = new Corestore(ledger.getRawCorestoreDir());
+					await corestore.ready();
+					// "glon-writer" is our local writer hypercore. corestore
+					// persists it by name, so daemon restarts reopen the same
+					// keypair and we keep our identity across reboots.
+					const localCore = corestore.get({ name: "glon-writer" });
+					await localCore.ready();
+
+					await ledger.initRawLedger({ corestore, localCore });
+					console.log(`[daemon] raw ledger online — writer pubkey: ${localCore.key.toString("hex").slice(0, 16)}...`);
+					console.log(`[daemon] raw ledger storage: ${ledger.getRawCorestoreDir()}`);
+				} catch (err: any) {
+					console.log(`[daemon] raw ledger bring-up failed: ${err?.message ?? err} (continuing without auction house)`);
+				}
+				// Network/replication (swarm wiring) lands in Phase 2.
+			} else try {
+				// ── Autobase backend (legacy default) ────────────
 				const { default: Corestore } = await import("corestore");
 				const { default: Autobase } = await import("autobase");
 				const { default: Hyperbee } = await import("hyperbee");
-				const autobaseHost = await import("../src/autobase-host.js");
+				const autobaseHost = await import("../src/ledger-host.js");
 
 				const corestore = new Corestore(autobaseHost.getCorestoreDir());
 				await corestore.ready();
 
-				// Bootstrap precedence:
-				//   1. GLON_AUTOBASE_BOOTSTRAP env (hex pubkey) — explicit override
-				//   2. ~/.glon/autobase/bootstrap.key — previously joined / created network
-				//   3. Hardcoded default — fresh installs join the shared glon network
 				let bootstrap: Buffer | null = null;
 				const envBootstrap = process.env.GLON_AUTOBASE_BOOTSTRAP;
 				if (envBootstrap && /^[0-9a-fA-F]{64}$/.test(envBootstrap)) {
@@ -155,8 +175,6 @@ async function resolveId(raw: string): Promise<string | null> {
 					apply: autobaseHost.apply,
 				});
 				await base.ready();
-				// Persist the bootstrap key on first start so subsequent restarts
-				// stay on the same network without env vars.
 				autobaseHost.persistBootstrap(base.key);
 
 				autobaseHost.initAutobase({
@@ -169,12 +187,6 @@ async function resolveId(raw: string): Promise<string | null> {
 				console.log(`[daemon] autobase online — bootstrap key: ${base.key.toString("hex").slice(0, 16)}...`);
 				console.log(`[daemon] autobase writer pubkey: ${base.local.key.toString("hex").slice(0, 16)}...`);
 
-				// ── Autobase replication over its own Hyperswarm ─────
-				// Separate swarm from swarm-host's: that one uses raw framing
-				// for transport envelopes; hypercore replication uses protomux
-				// channels and would conflict on the same stream. Two swarms
-				// is wasteful but cleanly separated. Phase 4+ can consolidate
-				// once swarm-host is protomux-native.
 				try {
 					const { default: Hyperswarm } = await import("hyperswarm");
 					const replSwarm = new Hyperswarm();
@@ -183,8 +195,6 @@ async function resolveId(raw: string): Promise<string | null> {
 					});
 					replSwarm.join(base.discoveryKey, { server: true, client: true });
 					console.log(`[daemon] autobase replication swarm joined topic ${base.discoveryKey.toString("hex").slice(0, 16)}...`);
-					// Stash on globalThis for shutdown — daemon is short-lived
-					// enough this is fine for v1.
 					(globalThis as any).__glonAutobaseSwarm = replSwarm;
 				} catch (err: any) {
 					console.log(`[daemon] autobase replication swarm failed: ${err?.message ?? err}`);

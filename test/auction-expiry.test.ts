@@ -14,7 +14,7 @@ import { join } from "node:path";
 import Corestore from "corestore";
 import Autobase from "autobase";
 import Hyperbee from "hyperbee";
-import { apply, canonicalSigningBytes } from "../src/autobase-host.ts";
+import { apply, canonicalSigningBytes } from "../src/ledger-host.ts";
 import { generateKeyPair, sign as ed25519Sign } from "../src/det/ed25519.ts";
 import { hexEncode, sha256 } from "../src/crypto.ts";
 import { parseDuration } from "../src/programs/handlers/auction.ts";
