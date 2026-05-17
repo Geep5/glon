@@ -4,37 +4,13 @@ dist/
 *.d.ts
 *.map
 
-
-# Program handlers are source (JS by design, not compiled TS)
-!src/programs/handlers/*.js
-
 # Secrets — loaded inline via env, never committed
 .env
 .env.*
 *.secret
 .DS_Store
-.run/
 
-# Local developer helper scripts that export credentials inline — never commit.
-ask-agent-about-architecture.sh
-check-agent-history.sh
-tell-agent-truth.sh
-
-	# Runtime artifacts
-	.glon-data/
-	*.log
-	*.pid
-	server.pid
-	dev-server.log
-	daemon-test.log
-
-	# Screenshots / docs drafts
-	*.png
-	UTXO_REVAMP.md
-
-# Alpaca trading scripts (contain API credentials inline)
-scripts/alpaca-filter.ts
-
-# Trading system (Alpaca credentials + proprietary strategy)
-src/programs/handlers/trading.ts
-scripts/trading-rounds.ts
+# Runtime artifacts
+*.log
+*.pid
+.figgies/
