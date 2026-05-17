@@ -1,0 +1,366 @@
+syntax = "proto3";
+package glon;
+
+// ═══════════════════════════════════════════════════════════════════
+// Glon OS — Protocol
+//
+// The protocol has three layers:
+//
+//   1. Change DAG — every mutation is a content-addressed protobuf
+//      message forming a DAG. This is the source of truth.
+//
+//   2. Sync Protocol — typed messages for exchanging DAG state
+//      between peers. A peer is any actor holding a copy of an
+//      object's change history.
+//
+//   3. Computed State — derived by replaying the DAG. Never stored
+//      as truth. Any peer can recompute it from changes alone.
+//
+// The transport is Rivet actors over HTTP. The protocol does not
+// depend on Rivet — it would work over any transport that can
+// deliver protobuf bytes between addressed endpoints.
+// ═══════════════════════════════════════════════════════════════════
+
+
+// ── Layer 1: The Change DAG ──────────────────────────────────────
+//
+// A Change is a single mutation in an object's history.
+// Content-addressed: id = SHA-256(encode(change with id zeroed)).
+// Parent edges form the DAG. Multiple parents = merge of concurrent
+// edits. No parents = genesis (object creation).
+//
+// Changes are immutable once created. The protobuf bytes on disk
+// ARE the change. There is no wrapper, no metadata file, no index
+// entry that supersedes the bytes.
+
+
+message Change {
+  bytes  id         = 1;    // SHA-256 content address
+  string object_id  = 2;    // stable object identifier
+  repeated bytes parent_ids = 3;  // DAG edges to parent changes
+  repeated Operation ops    = 4;  // mutations in this change
+  int64  timestamp  = 5;    // unix ms
+  string author     = 6;    // author/device identifier
+
+  // Snapshots are never source of truth — they are a replay optimization.
+  // The DAG of ops remains canonical; snapshots just let us skip prefix replay.
+  ObjectSnapshot snapshot = 7;  // optional state checkpoint (speeds up replay)
+
+	  // Generic auth extension for extensible authentication.
+	  // The type field selects a registered verifier; the payload is opaque
+	  // to the kernel and interpreted by the verifier.
+	  AuthExtension auth_extension = 22;
+
+	}
+message X402Auth {
+  bytes  nonce       = 1;  // 32-byte unique nonce
+  int64  valid_after  = 2; // unix seconds (inclusive)
+  int64  valid_before = 3; // unix seconds (exclusive)
+}
+
+message AuthExtension {
+  string type = 1;
+  bytes payload = 2;
+}
+
+	// Ed25519 signature. For authExtension type "ed25519", the payload contains
+	// an encoded Signature. The signing bytes zero `id` and the signature bytes
+	// inside the payload; pubkey IS included (the signer commits to it).
+message Signature {
+  bytes  pubkey    = 1;    // 32-byte Ed25519 public key
+  bytes  signature = 2;    // 64-byte Ed25519 signature
+}
+
+// Atomic mutation within a Change. Applied in order during replay.
+message Operation {
+  oneof op {
+    ObjectCreate  object_create  = 1;
+    ObjectDelete  object_delete  = 2;
+    FieldSet      field_set      = 3;
+    FieldDelete   field_delete   = 4;
+    BlockAdd      block_add      = 6;
+    BlockRemove   block_remove   = 7;
+    BlockUpdate   block_update   = 8;
+    BlockMove     block_move     = 9;
+  }
+}
+
+// Initialize an object with a type key. Must be the first op
+// in the genesis change (the change with no parents).
+message ObjectCreate {
+  string type_key = 1;
+}
+
+// Tombstone. The object is logically deleted. Ops after this
+// still apply (soft delete is a flag, not a barrier).
+message ObjectDelete {}
+
+// Set a named field to a typed value.
+message FieldSet {
+  string key   = 1;
+  Value  value = 2;
+}
+
+// Remove a named field.
+message FieldDelete {
+  string key = 1;
+}
+
+	// Insert a block into the block tree.
+message BlockAdd {
+  string parent_id = 1;   // parent block id ("" = root level)
+  string after_id  = 2;   // insert after this sibling ("" = first)
+  Block  block     = 3;
+}
+
+// Remove a block and its children.
+message BlockRemove {
+  string block_id = 1;
+}
+
+// Replace a block's content.
+message BlockUpdate {
+  string       block_id = 1;
+  BlockContent content  = 2;
+}
+
+// Move a block to a new position.
+message BlockMove {
+  string block_id      = 1;
+  string new_parent_id = 2;
+  string after_id      = 3;
+}
+
+
+// ── Layer 2: Sync Protocol ───────────────────────────────────────
+//
+// Typed messages for DAG exchange between peers. Pull-based:
+// a peer advertises its heads, the other responds with what's
+// missing. Every message is an Envelope with a typed payload.
+//
+// The transport is Rivet actor actions over HTTP. Each object
+// actor is a sync peer — globally addressable, durable,
+// wakes on demand.
+
+message Envelope {
+  string from_id   = 1;    // sender actor/object id
+  string to_id     = 2;    // recipient actor/object id
+  int64  timestamp = 3;
+
+  oneof message {
+    // Sync: DAG exchange
+    HeadAdvertise   head_advertise   = 10;
+    HeadRequest     head_request     = 11;
+    ChangePush      change_push      = 12;
+    ChangeRequest   change_request   = 13;
+
+    // Subscriptions: live updates
+    ObjectSubscribe object_subscribe = 20;
+    ObjectEvent     object_event     = 21;
+
+    // Application: free-form IPC between objects
+    AppMessage      app_message      = 30;
+  }
+}
+
+// "Here are my heads for this object."
+// Sent on connection or periodically. Receiver compares against
+// its own heads to determine what's missing on either side.
+message HeadAdvertise {
+  string object_id       = 1;
+  repeated bytes head_ids = 2;  // content-addressed change ids
+}
+
+// "Send me changes between these known ancestors and these heads."
+// Response is a ChangePush.
+message HeadRequest {
+  string object_id        = 1;
+  repeated bytes known_ids  = 2;  // changes I already have
+  repeated bytes target_ids = 3;  // heads I want to reach
+}
+
+// "Here are changes you're missing."
+// Changes are topologically sorted — the receiver can apply them
+// incrementally without needing the full DAG upfront.
+message ChangePush {
+  string object_id       = 1;
+  repeated Change changes = 2;  // topologically sorted
+}
+
+// "Send me these specific changes by hash."
+// Fallback when HeadRequest can't express the need.
+message ChangeRequest {
+  string object_id         = 1;
+  repeated bytes change_ids = 2;
+}
+
+// "Notify me when this object changes."
+message ObjectSubscribe {
+  string object_id = 1;
+}
+
+// "This object changed."
+message ObjectEvent {
+  string object_id           = 1;
+  repeated bytes new_head_ids = 2;
+  repeated Change changes     = 3;  // inline, saves a round-trip
+}
+
+// Free-form application message. The old Envelope behavior
+// for non-sync IPC between objects.
+message AppMessage {
+  string action  = 1;
+  bytes  payload = 2;
+}
+
+
+// ── Layer 3: Computed State ──────────────────────────────────────
+//
+// Derived by replaying the DAG. Never the source of truth.
+// ObjectSnapshot can be embedded in a Change as a checkpoint
+// to speed up replay (skip everything before the snapshot).
+
+message ObjectSnapshot {
+  string id       = 1;
+  string type_key = 2;
+  map<string, Value> fields = 3;
+  // Deprecated: content moved to primary block
+  bytes content = 4;
+  repeated Block blocks = 5;
+  bool   deleted    = 6;
+  int64  created_at = 7;
+  int64  updated_at = 8;
+}
+
+// Lightweight reference for listings. No content, no fields.
+message ObjectRef {
+  string id        = 1;
+  string type_key  = 2;
+  int64  created_at = 3;
+  int64  updated_at = 4;
+}
+
+
+// ── Blocks ───────────────────────────────────────────────────────
+//
+// Objects contain a tree of blocks. A page's blocks are paragraphs,
+// headings, lists. A database's blocks are records. Composable.
+
+message Block {
+  string id = 1;
+  repeated string children_ids = 2;
+  BlockContent content = 3;
+}
+
+message BlockContent {
+  oneof content {
+    TextContent   text   = 1;
+    CustomContent custom = 2;
+  }
+}
+
+// Program-defined block content. The OS stores, syncs, and
+// content-addresses it without interpreting the payload.
+// Programs encode their domain-specific block data into `data`
+// and declare the type via `content_type`. The `meta` map lets
+// the OS display a fallback (title, description) for blocks
+// whose type it doesn't understand.
+message CustomContent {
+  string content_type          = 1;  // e.g. "image", "table", "embed"
+  bytes  data                  = 2;  // program-encoded payload
+  map<string, string> meta     = 3;  // fallback display metadata
+}
+
+message TextContent {
+  string    text  = 1;
+  TextStyle style = 2;
+}
+
+enum TextStyle {
+  PARAGRAPH = 0;
+  HEADER1   = 1;
+  HEADER2   = 2;
+  HEADER3   = 3;
+  QUOTE     = 4;
+  CODE      = 5;
+  BULLET    = 6;
+  NUMBERED  = 7;
+  CHECKBOX  = 8;
+}
+
+
+// ── Values ───────────────────────────────────────────────────────
+//
+// Typed values for fields. The oneof enforces type safety at the
+// protobuf level — no stringly-typed maps.
+//
+// Value is recursive: ValueMap and ValueList contain Values,
+// so programs can express arbitrarily nested structures without
+// modifying glon.proto. A browser stores cookie jars as nested
+// maps. A spreadsheet stores cell metadata as typed lists.
+// Glon carries it all through the same Change DAG.
+
+message Value {
+  oneof kind {
+    string     string_value  = 1;
+    int64      int_value     = 2;
+    double     float_value   = 3;
+    bool       bool_value    = 4;
+    bytes      bytes_value   = 5;
+    StringList list_value    = 6;
+    ValueMap   map_value     = 7;   // nested key-value
+    ValueList  values_value  = 8;   // heterogeneous typed list
+    ObjectLink link_value    = 9;   // typed link to another object
+  }
+}
+
+// A typed link from this object to another.
+// Links are field values — they participate in FieldSet/FieldDelete like any
+// other Value kind. A Task's "assignee" field is a link to a Person object.
+// Links in a ValueList express one-to-many (a Project's "tasks" field).
+message ObjectLink {
+  string target_id    = 1;  // the linked object's UUID
+  string relation_key = 2;  // e.g. "assignee", "parent", "blocks"
+}
+
+message StringList {
+  repeated string values = 1;
+}
+
+// Recursive map: string keys to typed Values.
+message ValueMap {
+  map<string, Value> entries = 1;
+}
+
+// Recursive list: ordered sequence of typed Values.
+message ValueList {
+  repeated Value items = 1;
+}
+
+
+// ── Transport Layer ──────────────────────────────────────────────
+//
+// Transport-agnostic envelope for moving opaque bytes between
+// Glon instances. Transports carry Envelope bytes; the router
+// dispatches by content_type. No gossip, no consensus — just
+// signed payloads moved over whatever pipe is available.
+
+message TransportEnvelope {
+  string content_type = 1;        // e.g. "glon/change-bundle", "glon/text"
+  bytes payload = 2;              // content-type-specific bytes
+  bytes sender_pubkey = 3;        // optional convenience for receiver lookup
+  map<string, string> metadata = 4;
+}
+
+// A bundle of Changes for import. No id, no hash — the Changes
+// inside are individually content-addressed. The bundle is a
+// transient wrapper that ceases to exist after dispatch.
+message ChangeBundle {
+  repeated bytes changes = 1;     // each is a serialized Change proto
+}
+
+// A lightweight text message for agent-to-agent chat.
+// Carried in TransportEnvelope with content_type="glon/text".
+message TextMessage {
+  string text = 1;
+}
