@@ -75,6 +75,38 @@ const BASE_TOOLS: ToolSpec[] = [
 		target_action: "setTrust",
 	},
 	{
+		name: "peer_message_send",
+		description: "Send a text message to another peered agent or human over Hyperswarm peer-chat. The target must be peered (trust_level family/ops/self). Pass peer_id (from peer_list) OR identity_pubkey if you have the raw hex. Optionally set in_reply_to to thread.",
+		input_schema: {
+			type: "object",
+			properties: {
+				peer_id: { type: "string", description: "Peer id from /peer (preferred)." },
+				identity_pubkey: { type: "string", description: "64-hex identity pubkey (alternative to peer_id)." },
+				display_name: { type: "string", description: "Display name if neither peer_id nor a known identity_pubkey resolves." },
+				text: { type: "string", description: "Message body, up to ~8000 chars." },
+				in_reply_to: { type: ["string", "null"], description: "Optional msg_id this message is a reply to." },
+			},
+			required: ["text"],
+		},
+		target_prefix: "/peer-chat",
+		target_action: "send",
+	},
+	{
+		name: "peer_message_list",
+		description: "List messages in a peer-chat conversation, newest last. Pass peer_id or identity_pubkey to identify the conversation. since (ms epoch) returns only newer messages; limit caps the count.",
+		input_schema: {
+			type: "object",
+			properties: {
+				peer_id: { type: "string" },
+				identity_pubkey: { type: "string" },
+				since: { type: "number" },
+				limit: { type: "number" },
+			},
+		},
+		target_prefix: "/peer-chat",
+		target_action: "listMessages",
+	},
+	{
 		name: "discord_send",
 		description: "Send a Discord DM to a peer (who must have discord_id set). Use peer_list / peer_get to find the peer id.",
 		input_schema: {
