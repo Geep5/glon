@@ -1,0 +1,71 @@
+[daemon] connecting to http://localhost:6420
+[daemon] swarm online — hyperswarm pubkey: 887ae52bf83320cd...
+[daemon] raw ledger online — writer pubkey: 9871c38a65dba6e7...
+[daemon] raw ledger storage: /Users/grantfarwell/.glon/ledger/corestore
+[daemon] raw ledger replication swarm joined topic "glon-ah-mainnet-v1" (ddec08cee51603f1...)
+[daemon] raw ledger announce topic joined (20a36ca1207780fe...)
+[program] Failed to bundle "Coin": Cannot resolve module: ../../autobase-host.js
+[program] Failed to bundle "Auction": Cannot resolve module: ../../autobase-host.js
+[daemon] loaded 45 programs
+[daemon] started /crud (actor=true, tickMs=-)
+[daemon] started /inspect (actor=true, tickMs=-)
+[daemon] started /comment (actor=true, tickMs=-)
+[daemon] started /agent (actor=true, tickMs=-)
+[daemon] started /gc (actor=true, tickMs=-)
+[daemon] started /sync (actor=true, tickMs=-)
+[daemon] started /graph (actor=true, tickMs=-)
+[daemon] started /peer (actor=true, tickMs=-)
+[daemon] started /holdfast (actor=true, tickMs=-)
+[daemon] started /discord (actor=true, tickMs=3000)
+[daemon] started /remind (actor=true, tickMs=30000)
+[daemon] started /memory (actor=true, tickMs=-)
+[daemon] started /todo (actor=true, tickMs=-)
+[daemon] started /wallet (actor=true, tickMs=-)
+[daemon] started /consensus (actor=true, tickMs=-)
+[2m  [anchor] mining DISABLED — onTick will no-op until /anchor setEnabled true[0m
+[daemon] started /anchor (actor=true, tickMs=60000)
+[daemon] started /timelord (actor=true, tickMs=-)
+[daemon] started /shell (actor=true, tickMs=-)
+[daemon] started /auth (actor=true, tickMs=-)
+[daemon] started /transport-file (actor=true, tickMs=-)
+[daemon] started /transport-router (actor=true, tickMs=5000)
+[daemon] started /transport-discord (actor=true, tickMs=-)
+[daemon] started /transport-http (actor=true, tickMs=-)
+[daemon] started /swap (actor=true, tickMs=-)
+[daemon] started /swap-email (actor=true, tickMs=60000)
+[daemon] started /transport-gmail (actor=true, tickMs=-)
+[daemon] started /user-chat (actor=true, tickMs=-)
+[33m[directory] joinTopic deferred to tick: Program not running: /transport-hyperswarm[0m
+[daemon] started /directory (actor=true, tickMs=30000)
+[daemon] started /trade (actor=true, tickMs=30000)
+[daemon] started /transport-hyperswarm (actor=true, tickMs=-)
+[daemon] started /peer-chat (actor=true, tickMs=-)
+[daemon] started /btc-tools (actor=true, tickMs=-)
+[daemon] started /alpaca (actor=true, tickMs=-)
+[daemon] started /hyperliquid (actor=true, tickMs=-)
+[daemon] started /duel (actor=true, tickMs=-)
+[daemon] 35 actor(s) running. Diskstats: {
+  changeCount: 9017,
+  totalBytes: 116080644,
+  path: '/Users/grantfarwell/.glon'
+}
+node:events:485
+      throw er; // Unhandled 'error' event
+      ^
+
+Error: listen EADDRINUSE: address already in use 127.0.0.1:6430
+    at Server.setupListenHandle [as _listen2] (node:net:1940:16)
+    at listenInCluster (node:net:1997:12)
+    at node:net:2206:7
+    at process.processTicksAndRejections (node:internal/process/task_queues:90:21)
+Emitted 'error' event on Server instance at:
+    at emitErrorNT (node:net:1976:8)
+    at process.processTicksAndRejections (node:internal/process/task_queues:90:21) {
+  code: 'EADDRINUSE',
+  errno: -48,
+  syscall: 'listen',
+  address: '127.0.0.1',
+  port: 6430
+}
+
+Node.js v24.4.1

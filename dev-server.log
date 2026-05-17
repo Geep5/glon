@@ -1,0 +1,13 @@
+
+> glon@0.1.0 dev
+> npx tsx --watch src/index.ts
+
+(node:2100873) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+  RivetKit 2.2.1 (File System - Runner)
+  - Inspector:    http://127.0.0.1:6420/ui/
+  - Actors:       3
+  - Data:         /home/geep/.local/share/rivetkit/Graice-381ccd3f
+  - Instances:    1142
+
