@@ -150,12 +150,22 @@ You do NOT need to call peer_list first. The display_name resolves
 directly. If the name is unknown, peer_conversation_start fails with a
 clear error and you can fall back to peer_list to disambiguate.
 
-**When to call done.** Be willing to end conversations. After the goal is
-achieved, or once a reply would just be filler ("thanks!", "sounds good!",
-"talk soon!"), call \`peer_conversation_done\` instead of sending another
-message. The conversation closes cleanly; either party can always start a
-new one with a fresh goal. Two-line greetings get done after one exchange.
-Real tasks get done when the task is complete. Don't drift.
+**When to call done.** Be willing to end conversations — but err toward
+keeping them open when the other side is a human (kind=human peer record).
+Humans expect to ask follow-up questions; closing after a greeting strands
+the next message in a dead thread.
+
+- Peer is an AGENT (kind=agent): close aggressively once the goal is met.
+  Two-line greetings get done after one exchange. Real tasks get done when
+  the task is complete. Don't drift.
+- Peer is a HUMAN (kind=human): stay open. Close only when the human says
+  goodbye ("thanks bye", "that's all", "ttyl") or after a clear sign-off.
+  After answering a question, leave the conversation active in case they
+  follow up. Don't call done on a greeting.
+
+Either way, when you DO close, include a short reason in
+\`peer_conversation_done({reason: "..."})\`. That note is shown to the
+human and helps if they decide to start a new thread.
 
 **Auto-trigger.** When a peer message lands in an active conversation, your
 agent loop fires automatically — you don't have to be asked. Evaluate the

@@ -571,23 +571,63 @@ async function doEndConversation(ctx: ProgramContext, input: EndConversationInpu
 	if (!conv) throw new Error(`peer-chat endConversation: conversation ${input.conversation_id} not found`);
 	if (conv.status === "done") return { ok: true }; // idempotent
 	const now = Date.now();
+	const reason = (input.reason ?? "").toString().slice(0, 200) || "no reason given";
 	conv.status = "done";
 	conv.ended_at = now;
-	conv.ended_reason = (input.reason ?? "").toString().slice(0, 200) || "no reason given";
+	conv.ended_reason = reason;
 	conv.ended_by_agent_id = input.from_agent_id ?? conv.owner_agent_id;
 	state.conversations[conv.id] = conv;
 
-	// Mirror too (one side closing closes the whole thread, like real life)
+	// Same-machine mirror: closing one side closes the linked one too.
 	if (conv.mirror_conversation_id) {
 		const mirror = getConversation(state, conv.mirror_conversation_id);
 		if (mirror && mirror.status !== "done") {
 			mirror.status = "done";
 			mirror.ended_at = now;
-			mirror.ended_reason = conv.ended_reason;
+			mirror.ended_reason = reason;
 			mirror.ended_by_agent_id = conv.ended_by_agent_id;
 			state.conversations[mirror.id] = mirror;
 		}
 	}
+
+	// Cross-machine: tell the remote side this conversation is done. Without
+	// this, their conv stays "active" while ours is "done" — they'll send
+	// more messages and we'll silently drop them because we can't append
+	// to a closed thread, AND if they're the agent owner their auto-trigger
+	// won't fire because status check requires active. Best-effort send;
+	// don't fail the local close on network hiccup.
+	const isLocalTarget = String(conv.peer_identity_pubkey || "").startsWith("local:");
+	if (!isLocalTarget && conv.peer_hyperswarm_pubkey) {
+		try {
+			const self_identity = await resolveSelfIdentity(ctx);
+			let to_agent_id: string | undefined;
+			try {
+				const peerRow = await ctx.dispatchProgram("/peer", "get", [conv.peer_object_id]) as { agent_id_remote?: string } | null;
+				to_agent_id = peerRow?.agent_id_remote;
+			} catch { /* peer gone — proceed without targeted routing */ }
+			const msg_id = randomUUID().replace(/-/g, "").slice(0, 16);
+			const payload: PeerChatPayload = {
+				msg_id,
+				kind: "done",
+				in_reply_to: null,
+				body: reason,
+				sent_at: now,
+				from_identity_pubkey: self_identity,
+				from_agent_id: input.from_agent_id,
+				to_agent_id,
+			};
+			const payload_b64 = Buffer.from(JSON.stringify(payload)).toString("base64");
+			await ctx.dispatchProgram("/transport-hyperswarm", "send", [{
+				endpoint: `swarm://${conv.peer_hyperswarm_pubkey}`,
+				payload_b64,
+				content_type: PEER_CHAT_CONTENT_TYPE,
+				metadata: { msg_id, conversation_id: conv.id, kind: "done" },
+			}]);
+		} catch (err: any) {
+			ctx.print?.(dim(`[peer-chat] cross-machine done send failed: ${err?.message ?? err}`));
+		}
+	}
+
 	await persistIfChanged(state, ctx);
 	return { ok: true };
 }
@@ -743,8 +783,33 @@ async function doHandleIncoming(ctx: ProgramContext, input: HandleIncomingInput)
 	// gets a notification, no agent processes it automatically).
 	const owner_agent_id = payload.to_agent_id;
 
-	// Persist.
+	// Cross-machine "done" envelope: the remote side closed this thread.
+	// Close our matching conv so the user / our agent stops trying to
+	// reply into a dead conversation. Look up the conv by the explicit
+	// conversation_id in metadata first; fall back to the latest active
+	// one for this sender.
 	const state = ctx.state;
+	if (payload.kind === "done") {
+		const meta_conv_id = (input as any)?.metadata?.conversation_id ?? null;
+		let target: Conversation | null = meta_conv_id ? getConversation(state, meta_conv_id) : null;
+		if (!target) {
+			const candidates = Object.values((state.conversations ?? {}) as Record<string, Conversation>)
+				.filter((c) => c.peer_identity_pubkey.toLowerCase() === (senderPeer.identity_pubkey as string).toLowerCase())
+				.filter((c) => c.status === "active")
+				.sort((a, b) => b.started_at - a.started_at);
+			target = candidates[0] ?? null;
+		}
+		if (target && target.status !== "done") {
+			target.status = "done";
+			target.ended_at = payload.sent_at;
+			target.ended_reason = String(payload.body ?? "remote closed");
+			state.conversations[target.id] = target;
+			await persistIfChanged(state, ctx);
+		}
+		return true;
+	}
+
+	// Persist.
 	// Match an existing active conversation with this peer, else start one
 	// (cross-machine peers that don't speak the new protocol won't send
 	// conversation_id metadata yet; we accept this gracefully).
