@@ -952,18 +952,30 @@ async function doEnsureRosterPost(state: Record<string, any>, input: EnsureRoste
 	state.rosterPostByUuid = state.rosterPostByUuid ?? {} as Record<string, string>;
 
 	// Try edit-in-place candidates first: explicit input, then in-process cache.
+	// Each candidate is verified to live in the current GLON_A2A_DISCORD_GUILD
+	// before we touch it — otherwise we'd accidentally edit a stale post in a
+	// different guild that the bot is also a member of (cross-guild leak).
 	const candidates: string[] = [];
 	if (input.roster_thread_id) candidates.push(input.roster_thread_id);
 	const cached = state.rosterPostByUuid[input.agent_uuid];
 	if (cached && cached !== input.roster_thread_id) candidates.push(cached);
 
+	const currentGuildId = a2aGuildId();
 	for (const tid of candidates) {
+		let okGuild = false;
+		try {
+			const meta = await discord("GET", `/channels/${tid}`);
+			okGuild = String(meta?.guild_id ?? "") === currentGuildId;
+		} catch {
+			// 404 / 403 — drop this candidate, move on
+		}
+		if (!okGuild) continue;
 		try {
 			await doEditRosterCard({ thread_id: tid, card, status: "online", forum_tags: forum.tags });
 			state.rosterPostByUuid[input.agent_uuid] = tid;
 			return { roster_thread_id: tid, starter_message_id: tid, created: false };
 		} catch {
-			// thread deleted or otherwise unreachable — try next candidate
+			// thread in wrong forum within the same guild, or other edit failure
 		}
 	}
 
