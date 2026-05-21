@@ -193,12 +193,21 @@ const PERM_OVERWRITE_TYPE_MEMBER = 1;
 // hides the thread. A future post in an archived thread auto-unarchives it.
 const A2A_THREAD_AUTO_ARCHIVE_MINUTES = Number(process.env.GLON_A2A_THREAD_AUTO_ARCHIVE_MINUTES ?? 10080);
 
+/** Operator user IDs that should also see + post in the private A2A
+ *  channels. Set GLON_A2A_DISCORD_OPERATOR_IDS to a comma-separated
+ *  list of Discord user ids. Guild owners technically have admin
+ *  access already, but Discord's sidebar hides @everyone-denied
+ *  channels even from admins by default — adding an explicit member
+ *  allow makes them appear normally. */
+function operatorUserIds(): string[] {
+	const raw = process.env.GLON_A2A_DISCORD_OPERATOR_IDS ?? "";
+	return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
 /** Permission overwrite array that hides a channel from @everyone but
- *  grants the bot user explicit view/send/history/manage/threads. Discord's
- *  permission system: channel-level overwrites trump role-level grants,
- *  so denying @everyone (which the bot is in) requires an explicit
- *  member-level allow for the bot to keep posting. The server owner
- *  retains access through implicit admin. */
+ *  grants the bot user explicit view/send/history/manage/threads, plus
+ *  the same (minus manage) for each operator listed in
+ *  GLON_A2A_DISCORD_OPERATOR_IDS. */
 function buildPrivateA2AOverwrites(guildId: string, botUserId: string): Array<{ id: string; type: number; allow: string; deny: string }> {
 	const botAllow = (
 		PERM_VIEW_CHANNEL
@@ -209,7 +218,13 @@ function buildPrivateA2AOverwrites(guildId: string, botUserId: string): Array<{ 
 		| PERM_CREATE_PUBLIC_THREADS
 		| PERM_SEND_MESSAGES_IN_THREADS
 	).toString();
-	return [
+	const operatorAllow = (
+		PERM_VIEW_CHANNEL
+		| PERM_SEND_MESSAGES
+		| PERM_READ_MESSAGE_HISTORY
+		| PERM_SEND_MESSAGES_IN_THREADS
+	).toString();
+	const overwrites: Array<{ id: string; type: number; allow: string; deny: string }> = [
 		{
 			id: guildId,                         // @everyone role's id == guild id
 			type: PERM_OVERWRITE_TYPE_ROLE,
@@ -223,6 +238,15 @@ function buildPrivateA2AOverwrites(guildId: string, botUserId: string): Array<{ 
 			deny: "0",
 		},
 	];
+	for (const opId of operatorUserIds()) {
+		overwrites.push({
+			id: opId,
+			type: PERM_OVERWRITE_TYPE_MEMBER,
+			allow: operatorAllow,
+			deny: "0",
+		});
+	}
+	return overwrites;
 }
 
 interface DiscordChannelSummary {
@@ -1989,11 +2013,12 @@ const actorDef: ProgramActorDef = {
 			return { ok: true };
 		},
 
-		/** Retrofit existing A2A category + pair channels with private
-		 *  permission overwrites (deny @everyone view, allow the bot). New
-		 *  channels created after this commit already include the overrides
-		 *  at creation time; this action exists for channels that pre-date
-		 *  the privacy change. Idempotent — overwrite array replaces wholesale. */
+		/** Retrofit existing A2A category + pair channels + roster forum with
+		 *  private permission overwrites (deny @everyone view, allow the bot
+		 *  + any GLON_A2A_DISCORD_OPERATOR_IDS). New channels created after
+		 *  this code already include the overrides at creation time; this
+		 *  action exists for channels that pre-date the operator-id work or
+		 *  for refreshing perms after env config changes. Idempotent. */
 		makePrivateA2A: async (ctx: ProgramContext) => {
 			const guildId = a2aGuildId();
 			const botUserId = await getBotUserId(ctx.state);
@@ -2005,14 +2030,16 @@ const actorDef: ProgramActorDef = {
 			await discord("PATCH", `/channels/${cat.category_id}`, { permission_overwrites: overwrites });
 			updated.push(`category ${cat.category_id}`);
 
-			// Then every pair channel under it
+			// Then every channel under it: pair channels (text) + roster (forum)
 			const channels = await listGuildChannels(guildId);
-			const pairs = channels.filter((c) =>
-				c.type === DISCORD_CHANNEL_TYPE_TEXT
-				&& c.parent_id === cat.category_id
-				&& c.name.startsWith("pair-"),
+			const children = channels.filter((c) =>
+				c.parent_id === cat.category_id
+				&& (
+					(c.type === DISCORD_CHANNEL_TYPE_TEXT && c.name.startsWith("pair-"))
+					|| c.type === DISCORD_CHANNEL_TYPE_FORUM
+				),
 			);
-			for (const ch of pairs) {
+			for (const ch of children) {
 				try {
 					await discord("PATCH", `/channels/${ch.id}`, { permission_overwrites: overwrites });
 					updated.push(`${ch.name} (${ch.id})`);
@@ -2020,8 +2047,9 @@ const actorDef: ProgramActorDef = {
 					ctx.print(dim(`  [discord] makePrivateA2A: failed to update ${ch.name}: ${err?.message ?? String(err)}`));
 				}
 			}
-			// Invalidate the channel cache so the next pollA2A re-lists with fresh perms
+			// Invalidate caches so subsequent polls re-list with fresh perms.
 			state_invalidateChannelCache(ctx.state);
+			ctx.state.rosterForumByGuild = {};
 			return { updated, total: updated.length };
 		},
 	},
