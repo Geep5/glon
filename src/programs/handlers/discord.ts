@@ -949,22 +949,43 @@ async function doEnsureRosterPost(state: Record<string, any>, input: EnsureRoste
 		status_text: input.status_text,
 		updated_at: Date.now(),
 	};
-
-	// If caller knows the thread_id, edit it in place. Same with our daemon
-	// state cache from earlier creations.
 	state.rosterPostByUuid = state.rosterPostByUuid ?? {} as Record<string, string>;
-	const knownId = input.roster_thread_id ?? state.rosterPostByUuid[input.agent_uuid];
-	if (knownId) {
+
+	// Try edit-in-place candidates first: explicit input, then in-process cache.
+	const candidates: string[] = [];
+	if (input.roster_thread_id) candidates.push(input.roster_thread_id);
+	const cached = state.rosterPostByUuid[input.agent_uuid];
+	if (cached && cached !== input.roster_thread_id) candidates.push(cached);
+
+	for (const tid of candidates) {
 		try {
-			await doEditRosterCard({ thread_id: knownId, card, status: "online", forum_tags: forum.tags });
-			return { roster_thread_id: knownId, starter_message_id: knownId, created: false };
-		} catch (err: any) {
-			// Post may have been deleted manually; fall through to recreate.
-			state.rosterPostByUuid[input.agent_uuid] = "";
+			await doEditRosterCard({ thread_id: tid, card, status: "online", forum_tags: forum.tags });
+			state.rosterPostByUuid[input.agent_uuid] = tid;
+			return { roster_thread_id: tid, starter_message_id: tid, created: false };
+		} catch {
+			// thread deleted or otherwise unreachable — try next candidate
 		}
 	}
 
-	// Fresh create.
+	// Discord-as-truth fallback: scan all roster posts for an existing one
+	// matching this agent_uuid. This covers post-restart de-dup (in-memory
+	// cache wiped) and the case where a stored roster_thread_id points to
+	// a manually-deleted post.
+	try {
+		const existing = await doListRosterPosts(state, { include_archived: true });
+		const match = existing.find((e) => e.card.agent_uuid.toLowerCase() === input.agent_uuid.toLowerCase());
+		if (match) {
+			try {
+				await doEditRosterCard({ thread_id: match.roster_thread_id, card, status: "online", forum_tags: forum.tags });
+			} catch { /* edit might still fail; we still know the post exists */ }
+			state.rosterPostByUuid[input.agent_uuid] = match.roster_thread_id;
+			return { roster_thread_id: match.roster_thread_id, starter_message_id: match.roster_thread_id, created: false };
+		}
+	} catch {
+		// Scan failure shouldn't block creation.
+	}
+
+	// Fresh create — no existing post anywhere.
 	const created = await discord("POST", `/channels/${forum.forum_channel_id}/threads`, {
 		name: (input.display_name).slice(0, 100),
 		applied_tags: [forum.tags.online],
@@ -974,6 +995,40 @@ async function doEnsureRosterPost(state: Record<string, any>, input: EnsureRoste
 	if (!created?.id) throw new Error("Discord did not return a thread id when creating roster post");
 	state.rosterPostByUuid[input.agent_uuid] = String(created.id);
 	return { roster_thread_id: String(created.id), starter_message_id: String(created.id), created: true };
+}
+
+/** One-off cleanup: for each agent_uuid with more than one roster post,
+ *  keep the most recently updated and delete the rest. Idempotent. */
+async function doPruneDuplicateRosterPosts(state: Record<string, any>): Promise<{ kept: string[]; deleted: string[] }> {
+	const posts = await doListRosterPosts(state, { include_archived: true });
+	const byUuid = new Map<string, typeof posts>();
+	for (const p of posts) {
+		const key = p.card.agent_uuid.toLowerCase();
+		if (!byUuid.has(key)) byUuid.set(key, []);
+		byUuid.get(key)!.push(p);
+	}
+	const kept: string[] = [];
+	const deleted: string[] = [];
+	for (const [, group] of byUuid) {
+		if (group.length <= 1) {
+			if (group[0]) kept.push(group[0].roster_thread_id);
+			continue;
+		}
+		// Sort newest first; keep [0], delete the rest.
+		const sorted = group.slice().sort((a, b) => (b.card.updated_at ?? 0) - (a.card.updated_at ?? 0));
+		kept.push(sorted[0].roster_thread_id);
+		for (const dupe of sorted.slice(1)) {
+			try {
+				await discord("DELETE", `/channels/${dupe.roster_thread_id}`);
+				deleted.push(dupe.roster_thread_id);
+			} catch {
+				// Best effort.
+			}
+		}
+	}
+	// Reset the cache so subsequent calls re-discover.
+	state.rosterPostByUuid = {};
+	return { kept, deleted };
 }
 
 interface EditRosterCardInput {
@@ -2011,6 +2066,13 @@ const actorDef: ProgramActorDef = {
 			ctx.state.rosterNextHeartbeatAt = 0;
 			await maybeHeartbeatRoster(ctx.state, ctx);
 			return { ok: true };
+		},
+
+		/** Find agents with multiple roster posts (e.g. from pre-fix daemon
+		 *  restarts that didn't reuse existing posts) and delete all but the
+		 *  most recently updated. Idempotent — no-op once each agent has one. */
+		pruneDuplicateRosterPosts: async (ctx: ProgramContext) => {
+			return await doPruneDuplicateRosterPosts(ctx.state);
 		},
 
 		/** Retrofit existing A2A category + pair channels + roster forum with
