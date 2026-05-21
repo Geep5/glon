@@ -100,7 +100,10 @@ async function discord(method: string, path: string, body?: unknown): Promise<an
 		const raw = await res.text();
 		let retryAfter = 1;
 		try { retryAfter = JSON.parse(raw).retry_after ?? 1; } catch { /* ignore */ }
-		throw new Error(`Discord 429 — retry after ${retryAfter}s`);
+		const err = new Error(`Discord 429 — retry after ${retryAfter}s`) as Error & { retryAfter?: number; rateLimited?: boolean };
+		err.retryAfter = retryAfter;
+		err.rateLimited = true;
+		throw err;
 	}
 	if (!res.ok) {
 		const text = await res.text();
@@ -408,28 +411,72 @@ async function pollA2APairChannel(channelId: string, state: Record<string, any>,
 	return processed;
 }
 
-/** Enumerate pair channels under the A2A category and poll each. Returns
- *  total envelopes processed. */
+// A2A poll cadence + caching:
+// - pollA2AGuild is invoked from the actor tick (every 3s) but actually
+//   touches Discord only every A2A_POLL_INTERVAL_MS (default 15s).
+// - Channel listing is cached for A2A_CHANNEL_CACHE_TTL_MS so we don't
+//   re-list every poll cycle — new pair channels still get noticed
+//   when the cache expires, just not instantly.
+// - On a 429, we honour the server's retry_after and skip A2A polls
+//   until that deadline (plus a small buffer).
+const A2A_POLL_INTERVAL_MS = Number(process.env.GLON_A2A_POLL_INTERVAL_MS ?? 15_000);
+const A2A_CHANNEL_CACHE_TTL_MS = Number(process.env.GLON_A2A_CHANNEL_CACHE_TTL_MS ?? 60_000);
+
+/** Enumerate pair channels under the A2A category and poll each. Throttled
+ *  so we don't hammer Discord. Returns total envelopes processed (or 0 if
+ *  we're skipping this cycle). */
 async function pollA2AGuild(state: Record<string, any>, ctx: ProgramContext): Promise<number> {
 	if (!process.env.GLON_A2A_DISCORD_GUILD) return 0;
+
+	const now = Date.now();
+	if (typeof state.a2aNextPollAt === "number" && now < state.a2aNextPollAt) {
+		return 0; // throttled or rate-limited
+	}
+	// Schedule the next poll up front; on success we may extend it normally,
+	// on 429 we extend by the retry_after instead.
+	state.a2aNextPollAt = now + A2A_POLL_INTERVAL_MS;
+
 	let total = 0;
 	try {
 		const cat = await doEnsurePairCategory(state);
-		const channels = await listGuildChannels(a2aGuildId());
-		const pairChannels = channels.filter((c) =>
-			c.type === DISCORD_CHANNEL_TYPE_TEXT
-			&& c.parent_id === cat.category_id
-			&& c.name.startsWith("pair-"),
-		);
+
+		// Cache the pair-channel list so we don't list-channels every poll.
+		const cachedAt = typeof state.a2aChannelsCachedAt === "number" ? state.a2aChannelsCachedAt : 0;
+		let pairChannels: DiscordChannelSummary[];
+		if (Array.isArray(state.a2aChannelsCache) && now - cachedAt < A2A_CHANNEL_CACHE_TTL_MS) {
+			pairChannels = state.a2aChannelsCache as DiscordChannelSummary[];
+		} else {
+			const channels = await listGuildChannels(a2aGuildId());
+			pairChannels = channels.filter((c) =>
+				c.type === DISCORD_CHANNEL_TYPE_TEXT
+				&& c.parent_id === cat.category_id
+				&& c.name.startsWith("pair-"),
+			);
+			state.a2aChannelsCache = pairChannels;
+			state.a2aChannelsCachedAt = now;
+		}
+
 		for (const ch of pairChannels) {
 			try {
 				total += await pollA2APairChannel(ch.id, state, ctx);
 			} catch (err: any) {
+				if (err?.rateLimited) {
+					const wait = Math.max(1, Number(err.retryAfter ?? 1));
+					state.a2aNextPollAt = Date.now() + Math.round(wait * 1000) + 500;
+					ctx.print(dim(`  [discord] A2A rate-limited; backing off ${wait.toFixed(1)}s`));
+					return total;
+				}
 				ctx.print(dim(`  [discord] A2A poll error for ${ch.name}: ${err?.message ?? String(err)}`));
 			}
 		}
 	} catch (err: any) {
-		ctx.print(dim(`  [discord] A2A poll setup failed: ${err?.message ?? String(err)}`));
+		if (err?.rateLimited) {
+			const wait = Math.max(1, Number(err.retryAfter ?? 1));
+			state.a2aNextPollAt = Date.now() + Math.round(wait * 1000) + 500;
+			ctx.print(dim(`  [discord] A2A rate-limited (setup); backing off ${wait.toFixed(1)}s`));
+		} else {
+			ctx.print(dim(`  [discord] A2A poll setup failed: ${err?.message ?? String(err)}`));
+		}
 	}
 	return total;
 }
