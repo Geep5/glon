@@ -545,12 +545,13 @@ function buildShellTools(): ToolSpec[] {
 	];
 }
 
-function buildPeerChatTools(agentId: string): ToolSpec[] {
+function buildPeerChatTools(agentId: string, agentDisplayName: string): ToolSpec[] {
 	const sender = { from_agent_id: agentId };
+	const rosterReplyBound: Record<string, unknown> = { label: agentDisplayName };
 	return [
 		{
 			name: "peer_conversation_start",
-			description: "Start a new goal-driven conversation with a peered agent or human. Address the target by display_name when you know it (\"Mikey\", \"Tarzan\") — names are unique across local agents. Fall back to peer_id or agent_uuid only if name resolution is ambiguous. Always include a clear, specific goal (e.g. 'introduce ourselves', 'coordinate Cash's pickup tomorrow', 'compare task-tracking approaches'). The opening text becomes the first message. Returns conversation_id — use that in subsequent peer_message_send / peer_conversation_done calls.",
+			description: "Start a new goal-driven conversation with a peered agent or human. Address the target by display_name when you know it (\"Mikey\", \"Tarzan\") — names are unique across local agents. Fall back to peer_id or agent_uuid only if name resolution is ambiguous. Always include a clear, specific goal (e.g. 'introduce ourselves', 'coordinate Cash's pickup tomorrow', 'compare task-tracking approaches'). The opening text becomes the first message. Returns conversation_id — use that in subsequent peer_message_send / peer_conversation_done calls.\n\nDELEGATION: when you start this conversation as a result of a human asking you to ask someone else (e.g. \"can you ask Mikey…\"), pass `originated_from` with the source `thread_id` and `message_id` from the [origin_thread=… origin_msg=…] tags in your incoming H2A prompt. This lets the system automatically relay the eventual answer back to that human in their original chat thread — without it, the answer will sit on your A2A side and the requester never hears back.",
 			input_schema: {
 				type: "object",
 				required: ["goal", "text"],
@@ -560,11 +561,38 @@ function buildPeerChatTools(agentId: string): ToolSpec[] {
 					agent_uuid: { type: "string", description: "Globally unique agent UUID (v4). Use when display_name is ambiguous." },
 					goal: { type: "string", description: "Human-readable purpose, 1-280 chars." },
 					text: { type: "string", description: "Opening message." },
+					originated_from: {
+						type: "object",
+						description: "When this conversation is a delegation triggered by a human request, pass the source thread/message info so the answer can be relayed back automatically.",
+						properties: {
+							kind: { type: "string", description: "Origin type, e.g. 'discord-roster'." },
+							thread_id: { type: "string", description: "Discord thread id where the human asked." },
+							message_id: { type: "string", description: "Discord message id of the human's request." },
+							human_peer_id: { type: "string", description: "The human's /peer record id." },
+							human_display_name: { type: "string", description: "How to address them in the relay reply." },
+							original_request: { type: "string", description: "Short snippet of the human's original request (helps you remember what to relay)." },
+						},
+					},
 				},
 			},
 			target_prefix: "/peer-chat",
 			target_action: "startConversation",
 			bound_args: sender,
+		},
+		{
+			name: "roster_chat_reply",
+			description: "Post a message into a Discord roster thread (an agent's H2A chat room). Use this to relay an A2A answer back to the human who originally asked. The system will surface the right thread_id in your prompt when a relay is needed — just pass it through. Your name is auto-prefixed; you don't need to write \"<your name>:\" yourself.",
+			input_schema: {
+				type: "object",
+				required: ["thread_id", "text"],
+				properties: {
+					thread_id: { type: "string", description: "Discord thread id of the human's chat room — provided in the relay prompt." },
+					text: { type: "string", description: "Message body to post. Don't repeat your own name — the system will prefix it for you." },
+				},
+			},
+			target_prefix: "/discord",
+			target_action: "rosterChatReply",
+			bound_args: rosterReplyBound,
 		},
 		{
 			name: "peer_message_send",
@@ -632,12 +660,12 @@ function buildPeerChatTools(agentId: string): ToolSpec[] {
 	];
 }
 
-export function buildHarnessTools(agentId: string): ToolSpec[] {
+export function buildHarnessTools(agentId: string, agentDisplayName: string = "agent"): ToolSpec[] {
 	return [
 		...BASE_TOOLS,
 		...buildMemoryTools(agentId),
 		...buildShellTools(),
-		...buildPeerChatTools(agentId),
+		...buildPeerChatTools(agentId, agentDisplayName),
 		// /todo: phased task list per agent. Pairs with the follow-up hook
 		// in /agent — the harness re-prompts when items remain incomplete.
 		todoWriteToolSpec(agentId),
@@ -648,7 +676,18 @@ export function buildHarnessTools(agentId: string): ToolSpec[] {
 export async function autoWireTools(agentId: string, ctx: ProgramContext): Promise<{ wired: string[]; skipped: { name: string; reason: string }[]; pruned: string[] }> {
 	const wired: string[] = [];
 	const skipped: { name: string; reason: string }[] = [];
-	const tools = buildHarnessTools(agentId);
+	// Look up the agent's display name from the store so we can bake it
+	// into tools that need it (e.g., roster_chat_reply auto-prefixes
+	// the agent's name on every reply).
+	let agentDisplayName = "agent";
+	try {
+		const store = ctx.store as any;
+		const agent = await store.get(agentId);
+		const nameVal = agent?.fields?.name;
+		const extracted = typeof nameVal === "string" ? nameVal : nameVal?.stringValue;
+		if (extracted) agentDisplayName = String(extracted);
+	} catch { /* fall back to default */ }
+	const tools = buildHarnessTools(agentId, agentDisplayName);
 	for (const spec of tools) {
 		try {
 			await ctx.dispatchProgram("/agent", "registerTool", [agentId, JSON.stringify(spec)]);

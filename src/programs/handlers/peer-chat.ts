@@ -33,6 +33,21 @@ const MAX_GOAL_LEN = 100; // Discord thread name limit
 
 // ── Types (return-only — no persisted state) ────────────────────
 
+/** Optional delegation context attached to the opening envelope of an
+ *  A2A conversation. Lets the receiving daemon (or the originating agent
+ *  on done) know that this conversation was started on behalf of a human
+ *  who is waiting for the answer in some Discord chat thread. When set,
+ *  the daemon fires a relay step after the A2A closes so the agent can
+ *  post the result back to the original requester. */
+export interface OriginatedFrom {
+	kind: "discord-roster" | string;
+	thread_id: string;         // Discord thread the human was chatting in
+	message_id?: string;       // the human's message that triggered this delegation
+	human_peer_id?: string;    // /peer record id for the human
+	human_display_name?: string;
+	original_request?: string; // short snippet of what the human asked (for relay context)
+}
+
 interface A2AEnvelope {
 	v: 1;
 	from_agent_uuid: string;
@@ -40,6 +55,7 @@ interface A2AEnvelope {
 	to_agent_uuid: string;
 	to_display_name: string;
 	body: unknown;
+	originated_from?: OriginatedFrom;
 }
 
 export interface PeerMessage {
@@ -149,6 +165,12 @@ interface StartConversationInput {
 	goal: string;
 	text: string;
 	from_agent_id?: string;
+	/** When set, this conversation is a delegation triggered by a human's
+	 *  request. The daemon will surface this context in the relay-on-done
+	 *  auto-trigger so the agent can post the answer back to the original
+	 *  requester. Pass the source thread_id + message_id + human peer info
+	 *  captured from the H2A invocation prompt. */
+	originated_from?: OriginatedFrom;
 }
 
 interface StartConversationResult {
@@ -193,7 +215,8 @@ async function doStartConversation(ctx: ProgramContext, input: StartConversation
 	}]) as { thread_id: string; name: string };
 	if (!thread?.thread_id) throw new Error("peer-chat startConversation: /discord ensureConversationThread returned no thread_id");
 
-	// 3. Post the opening envelope inside the thread
+	// 3. Post the opening envelope inside the thread (includes the optional
+	//    originated_from delegation context so the relay-on-done step has it)
 	const envelope: A2AEnvelope = {
 		v: 1,
 		from_agent_uuid: sender.agent_uuid,
@@ -202,6 +225,16 @@ async function doStartConversation(ctx: ProgramContext, input: StartConversation
 		to_display_name: peer.display_name,
 		body: input.text,
 	};
+	if (input.originated_from && input.originated_from.thread_id) {
+		envelope.originated_from = {
+			kind: input.originated_from.kind || "discord-roster",
+			thread_id: String(input.originated_from.thread_id),
+			message_id: input.originated_from.message_id ? String(input.originated_from.message_id) : undefined,
+			human_peer_id: input.originated_from.human_peer_id ? String(input.originated_from.human_peer_id) : undefined,
+			human_display_name: input.originated_from.human_display_name ? String(input.originated_from.human_display_name) : undefined,
+			original_request: input.originated_from.original_request ? String(input.originated_from.original_request).slice(0, 500) : undefined,
+		};
+	}
 	const posted = await ctx.dispatchProgram("/discord", "postToThread", [{
 		thread_id: thread.thread_id,
 		envelope,
@@ -329,9 +362,10 @@ async function doHandleA2A(ctx: ProgramContext, input: HandleA2AInput): Promise<
 	if (!env || typeof env !== "object") return { processed: false, reason: "no envelope" };
 	if (env.v !== 1) return { processed: false, reason: `unknown version ${env.v}` };
 	if (!env.from_agent_uuid || !env.to_agent_uuid) return { processed: false, reason: "missing agent_uuids" };
-	if (input.thread_locked) return { processed: false, reason: "thread locked (conversation done)" };
 
-	// Recipient must be a local agent on this daemon
+	// Recipient must be a local agent on this daemon. We process locked
+	// threads here too — doneness is a property of the envelope (kind:done),
+	// not a reason to skip — and we may need to surface the relay step.
 	const recipient = await findLocalAgentByUuid(ctx, env.to_agent_uuid);
 	if (!recipient) return { processed: false, reason: "no local recipient" };
 
@@ -353,24 +387,114 @@ async function doHandleA2A(ctx: ProgramContext, input: HandleA2AInput): Promise<
 		return { processed: false, reason: "sender not peered" };
 	}
 
-	// Auto-trigger the recipient agent's loop with the message + thread context
+	// Look up the conversation's delegation context, if any. We do this for
+	// both text and done envelopes — for text we surface "you're answering
+	// on behalf of X" in the prompt; for done we surface "now relay back."
+	const originatedFrom = await lookupOriginatedFromForThread(ctx, input.thread_id);
+
 	const goal = (input.thread_name || "(no goal)").slice(0, 200);
 	const bodyPreview = String(env.body ?? "").slice(0, 1500);
-	const prompt = [
-		`You have a new peer-chat message in an active conversation.`,
-		`Conversation id: ${input.thread_id}`,
-		`Goal: ${goal}`,
-		`From: ${env.from_display_name || env.from_agent_uuid.slice(0, 8)}`,
-		`Message: ${bodyPreview}`,
-		``,
-		`If the goal is achieved or further reply would not add value, call peer_conversation_done with a short reason (this locks the thread). Otherwise, call peer_message_send with conversation_id=${input.thread_id} to reply. Do NOT ask the human user — this is autonomous A2A.`,
-	].join("\n");
+	const kind = env.kind === "done" ? "done" : "text";
+
+	let prompt: string;
+	if (kind === "done") {
+		// The peer just closed the conversation. Surface the closing reason
+		// + delegation context (if any) and instruct the agent on next step.
+		const lines = [
+			`A peer-chat conversation just closed.`,
+			`Conversation id: ${input.thread_id}`,
+			`Goal: ${goal}`,
+			`Closed by: ${env.from_display_name || env.from_agent_uuid.slice(0, 8)}`,
+			`Closing reason: ${bodyPreview}`,
+			``,
+		];
+		if (originatedFrom?.thread_id) {
+			lines.push(
+				`This conversation was started by you on behalf of ${originatedFrom.human_display_name ?? "a human requester"} ` +
+				`who asked you in Discord thread \`${originatedFrom.thread_id}\`.`,
+			);
+			if (originatedFrom.original_request) {
+				lines.push(`Their original request: "${originatedFrom.original_request}"`);
+			}
+			lines.push(``);
+			lines.push(
+				`Now relay the answer back to them. Call:`,
+				`  roster_chat_reply({`,
+				`    thread_id: "${originatedFrom.thread_id}",`,
+				`    text: "<a clear, concise summary of what you learned from the peer; address the requester by name>"`,
+				`  })`,
+				``,
+				`Your name (${recipient.display_name}) is auto-prefixed — don't write "${recipient.display_name}:" yourself.`,
+				`This is the last thing you need to do for this delegation. After posting, you're done.`,
+			);
+		} else {
+			lines.push(
+				`No relay context — the conversation closed cleanly. ` +
+				`If you have nothing further to do, this turn can be a no-op.`,
+			);
+		}
+		prompt = lines.join("\n");
+	} else {
+		const lines = [
+			`You have a new peer-chat message in an active conversation.`,
+			`Conversation id: ${input.thread_id}`,
+			`Goal: ${goal}`,
+			`From: ${env.from_display_name || env.from_agent_uuid.slice(0, 8)}`,
+			`Message: ${bodyPreview}`,
+			``,
+		];
+		if (originatedFrom?.thread_id) {
+			lines.push(
+				`Note: this conversation was started by you on behalf of ` +
+				`${originatedFrom.human_display_name ?? "a human requester"} in thread \`${originatedFrom.thread_id}\`. ` +
+				`When you call peer_conversation_done, the system will prompt you to relay back to them.`,
+			);
+			lines.push(``);
+		}
+		lines.push(
+			`If the goal is achieved or further reply would not add value, ` +
+			`call peer_conversation_done with a short reason (this locks the thread). ` +
+			`Otherwise, call peer_message_send with conversation_id=${input.thread_id} to reply. ` +
+			`Do NOT ask the human user — this is autonomous A2A.`,
+		);
+		prompt = lines.join("\n");
+	}
+
 	try {
 		await ctx.dispatchProgram("/agent", "ask", [recipient.agent_object_id, prompt]);
 	} catch (err: any) {
 		ctx.print?.(dim(`  [peer-chat] auto-trigger failed for ${recipient.agent_object_id}/${input.thread_id}: ${err?.message ?? err}`));
 	}
 	return { processed: true };
+}
+
+/** Fetch the conversation's opening envelope from Discord and extract its
+ *  originated_from delegation context (if any). Returns null when the
+ *  conversation wasn't started as a delegation from a human request. */
+async function lookupOriginatedFromForThread(ctx: ProgramContext, threadId: string): Promise<OriginatedFrom | null> {
+	try {
+		// The thread's starter message has the same id as the thread itself
+		// (Discord convention for thread-starter messages in pair channels).
+		const starter = await ctx.dispatchProgram("/discord", "listThreadMessages", [{
+			thread_id: threadId,
+			limit: 1,
+		}]) as Array<{ envelope?: A2AEnvelope }>;
+		if (!Array.isArray(starter) || starter.length === 0) return null;
+		const env = starter[0]?.envelope;
+		if (!env || !env.originated_from) return null;
+		const o = env.originated_from;
+		if (!o.thread_id) return null;
+		return {
+			kind: String(o.kind ?? "discord-roster"),
+			thread_id: String(o.thread_id),
+			message_id: o.message_id ? String(o.message_id) : undefined,
+			human_peer_id: o.human_peer_id ? String(o.human_peer_id) : undefined,
+			human_display_name: o.human_display_name ? String(o.human_display_name) : undefined,
+			original_request: o.original_request ? String(o.original_request) : undefined,
+		};
+	} catch {
+		return null;
+	}
 }
 
 // ── Read actions (everything fetches from Discord on demand) ────

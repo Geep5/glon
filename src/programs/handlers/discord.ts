@@ -736,6 +736,33 @@ async function pollA2AGuild(state: Record<string, any>, ctx: ProgramContext): Pr
 			threadsByChannel.get(summary.parent_id)!.push(summary);
 		}
 
+		// Also pull recently archived threads per pair channel — when a peer
+		// archives + locks a conversation right after their final message
+		// (the common goal-driven-done pattern), our active-threads listing
+		// no longer sees it. Without this, the originating agent never gets
+		// auto-triggered for the peer's last word + done envelope. We bound
+		// the lookback to threads archived within the last hour to avoid
+		// re-processing ancient closed conversations on every poll.
+		const archiveLookbackMs = 60 * 60 * 1000;
+		for (const ch of pairChannels) {
+			try {
+				const archivedRaw = await discord("GET", `/channels/${ch.id}/threads/archived/public?limit=20`);
+				const archivedList: any[] = archivedRaw?.threads ?? [];
+				for (const t of archivedList) {
+					const summary = threadFromRaw(t);
+					const archivedAt = t.thread_metadata?.archive_timestamp
+						? Date.parse(t.thread_metadata.archive_timestamp)
+						: 0;
+					if (archivedAt && Date.now() - archivedAt > archiveLookbackMs) continue;
+					if (!threadsByChannel.has(summary.parent_id)) threadsByChannel.set(summary.parent_id, []);
+					threadsByChannel.get(summary.parent_id)!.push(summary);
+				}
+			} catch (err: any) {
+				// Per-channel failure shouldn't abort the whole tick.
+				ctx.print(dim(`  [discord] A2A archived-threads fetch failed for ${ch.name}: ${err?.message ?? String(err)}`));
+			}
+		}
+
 		state.a2aThreadWatermarks = state.a2aThreadWatermarks ?? {};
 
 		for (const ch of pairChannels) {
@@ -767,7 +794,10 @@ async function pollA2AGuild(state: Record<string, any>, ctx: ProgramContext): Pr
 }
 
 async function pollA2AThread(thread: ThreadSummary, state: Record<string, any>, ctx: ProgramContext): Promise<number> {
-	if (thread.locked) return 0; // conversation is done — no new envelopes will be accepted
+	// Don't early-exit on locked threads — we need to process the final
+	// messages (especially the `done` envelope) so the originating agent
+	// can react. `handleA2A` itself sees `thread_locked: true` in the input
+	// and decides whether to fire the relay step vs. ignore.
 
 	const watermarks = state.a2aThreadWatermarks as Record<string, string>;
 	const watermark = watermarks[thread.thread_id];
@@ -1332,7 +1362,15 @@ async function routeRosterChatMessage(
 	// to /agent.ask directly (so we can target THIS agent, not the harness
 	// default that /holdfast.ingest is wired to).
 	const content = String(message.content ?? "").trim();
-	const prompt = `[from ${humanUsername} on discord-roster, trust=trusted] ${content}`;
+	// Inject the source thread/message ids so the agent can pass them as
+	// `originated_from` to peer_conversation_start when delegating an A2A
+	// task on this human's behalf. The system-prompt-side teaching is in
+	// the peer_conversation_start tool description.
+	const prompt =
+		`[from ${humanUsername} on discord-roster, trust=trusted] ` +
+		`[origin_thread=${thread.thread_id} origin_msg=${String(message.id)} ` +
+		`human_peer_id=${ensureRes?.id ?? ""} human_display_name=${humanUsername}] ` +
+		`${content}`;
 	const result = await ctx.dispatchProgram("/agent", "ask", [
 		agentPeer.agent_object_id,
 		prompt,
@@ -2311,6 +2349,22 @@ const actorDef: ProgramActorDef = {
 		 *  that don't want to wait for the 3s tick. */
 		pollRosterChat: async (ctx: ProgramContext) => {
 			return { processed: await pollRosterForumThreads(ctx.state, ctx) };
+		},
+
+		/** Post a message into a roster thread (the agent's chat room with
+		 *  humans). Used by agents when relaying a delegated A2A answer
+		 *  back to the human who originally asked. Takes a thread_id and
+		 *  text; optionally accepts a label that prepends "**<label>:** "
+		 *  for visual clarity. Splits long content across messages per
+		 *  Discord's 2000-char limit. */
+		rosterChatReply: async (_ctx: ProgramContext, input: string | { thread_id: string; text: string; label?: string }) => {
+			const args = typeof input === "string" ? JSON.parse(input) : input;
+			if (!args?.thread_id) throw new Error("rosterChatReply: thread_id required");
+			if (!args?.text) throw new Error("rosterChatReply: text required");
+			const label = args.label ? String(args.label).trim() : null;
+			const formatted = label ? `**${label}:** ${String(args.text)}` : String(args.text);
+			const ids = await postMessage(String(args.thread_id), formatted);
+			return { thread_id: String(args.thread_id), message_ids: ids };
 		},
 
 		/** Flip the roster forum's permission overrides from private to
