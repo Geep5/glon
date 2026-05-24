@@ -1,5 +1,5 @@
 import type { ProgramDef, ProgramContext } from "../runtime.js";
-import { dim, bold, cyan, red, green } from "../shared.js";
+import { dim, bold, cyan, red, green, yellow } from "../shared.js";
 
 // ── Board model ─────────────────────────────────────────────────
 
@@ -38,9 +38,9 @@ function readBoard(fields: any) {
 // ── Board rendering ─────────────────────────────────────────────
 
 function cellDisplay(cell: string, index: number) {
-  if (cell === "X") return CYAN + BOLD + " X " + RESET;
-  if (cell === "O") return RED + BOLD + " O " + RESET;
-  return DIM + " " + index + " " + RESET;
+  if (cell === "X") return cyan(bold(" X "));
+  if (cell === "O") return red(bold(" O "));
+  return dim(" " + index + " ");
 }
 
 function renderBoard(board: any) {
@@ -48,21 +48,21 @@ function renderBoard(board: any) {
   const lines = [
     "",
     "  " + cellDisplay(c[0], 0) + "\u2502" + cellDisplay(c[1], 1) + "\u2502" + cellDisplay(c[2], 2),
-    "  " + DIM + "\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u253c\u2500\u2500\u2500" + RESET,
+    "  " + dim("\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u253c\u2500\u2500\u2500"),
     "  " + cellDisplay(c[3], 3) + "\u2502" + cellDisplay(c[4], 4) + "\u2502" + cellDisplay(c[5], 5),
-    "  " + DIM + "\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u253c\u2500\u2500\u2500" + RESET,
+    "  " + dim("\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u253c\u2500\u2500\u2500"),
     "  " + cellDisplay(c[6], 6) + "\u2502" + cellDisplay(c[7], 7) + "\u2502" + cellDisplay(c[8], 8),
     "",
   ];
 
   if (board.status === "playing") {
-    lines.push("  " + BOLD + board.turn + RESET + "'s turn  " + DIM + "(move " + (board.moveCount + 1) + ")" + RESET);
+    lines.push("  " + bold(board.turn) + "'s turn  " + dim("(move " + (board.moveCount + 1) + ")"));
   } else if (board.status === "draw") {
-    lines.push("  " + YELLOW + BOLD + "Draw!" + RESET);
+    lines.push("  " + yellow(bold("Draw!")));
   } else {
     const winner = board.status === "X_wins" ? "X" : "O";
-    const color = winner === "X" ? CYAN : RED;
-    lines.push("  " + color + BOLD + winner + " wins!" + RESET + "  " + DIM + "(" + board.moveCount + " moves)" + RESET);
+    const color = winner === "X" ? cyan : red;
+    lines.push("  " + color(bold(winner + " wins!")) + "  " + dim("(" + board.moveCount + " moves)"));
   }
 
   return lines.join("\n");
@@ -142,7 +142,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 
       for (const op of c.ops) {
         if (op.objectCreate) {
-          lines.push("  " + DIM + hex + RESET + "  " + DIM + ts + RESET + "  " + GREEN + "new game" + RESET);
+          lines.push("  " + dim(hex) + "  " + dim(ts) + "  " + green("new game"));
         } else if (op.fieldSet) {
           const key = op.fieldSet.key;
           const val = extractString(op.fieldSet.value);
@@ -151,19 +151,19 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
           if (key.startsWith("cell_") && (val === "X" || val === "O")) {
             moveNum++;
             const pos = key.slice(5);
-            const color = val === "X" ? CYAN : RED;
-            lines.push("  " + DIM + hex + RESET + "  " + DIM + ts + RESET + "  " + BOLD + "#" + moveNum + RESET + " " + color + val + RESET + " \u2192 position " + pos);
+            const color = val === "X" ? cyan : red;
+            lines.push("  " + dim(hex) + "  " + dim(ts) + "  " + bold("#" + moveNum) + " " + color(val) + " \u2192 position " + pos);
           } else if (key === "status" && val !== "playing") {
-            const label = val === "draw" ? YELLOW + "draw" + RESET :
-              val === "X_wins" ? CYAN + BOLD + "X wins" + RESET :
-              RED + BOLD + "O wins" + RESET;
-            lines.push("  " + DIM + hex + RESET + "  " + DIM + ts + RESET + "  " + label);
+            const label = val === "draw" ? yellow("draw") :
+              val === "X_wins" ? cyan(bold("X wins")) :
+              red(bold("O wins"));
+            lines.push("  " + dim(hex) + "  " + dim(ts) + "  " + label);
           }
         }
       }
     }
 
-    if (lines.length === 0) return "  " + DIM + "(no moves)" + RESET;
+    if (lines.length === 0) return "  " + dim("(no moves)");
     return lines.join("\n");
   }
 
