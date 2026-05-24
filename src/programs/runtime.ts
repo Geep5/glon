@@ -13,85 +13,18 @@
  *   - `validatedTypes` — array of type keys the validator applies to
  */
 
-import type { Value, Change, ObjectRef } from "../proto.js";
-
-import { decodeSignature } from "../proto.js";
-
-import { canonicalEncodeChangeForSigning } from "../det/canonical.js";
-import { verify as ed25519Verify } from "../det/ed25519.js";
-
+import type { Value, Change } from "../proto.js";
 import * as proto from "../proto.js";
-
 import type { ObjectState } from "../dag/dag.js";
-
+import * as sharedMod from "./shared.js";
 import { style } from "./shared.js";
-	import * as sharedMod from "./shared.js";
 import * as cryptoMod from "../crypto.js";
-import * as detCanonical from "../det/canonical.js";
-
-// ── Minimal JSON Schema validator ───────────────────────────────
-
-function validateSchema(value: unknown, schema: Record<string, unknown>, path = ""): string | null {
-	if (schema.type === "object") {
-		if (typeof value !== "object" || value === null || Array.isArray(value)) {
-			return `${path || "root"} must be an object`;
-		}
-		const obj = value as Record<string, unknown>;
-		const required = (schema.required as string[]) ?? [];
-		for (const key of required) {
-			if (!(key in obj)) {
-				return `${path || "root"}.${key} is required`;
-			}
-		}
-		const props = schema.properties as Record<string, Record<string, unknown>> | undefined;
-		if (props) {
-			for (const [key, subSchema] of Object.entries(props)) {
-				if (key in obj) {
-					const err = validateSchema(obj[key], subSchema, `${path || "root"}.${key}`);
-					if (err) return err;
-				}
-			}
-		}
-		return null;
-	}
-	if (schema.type === "array") {
-		if (!Array.isArray(value)) {
-			return `${path || "root"} must be an array`;
-		}
-		const itemSchema = schema.items as Record<string, unknown> | undefined;
-		if (itemSchema) {
-			for (let i = 0; i < value.length; i++) {
-				const err = validateSchema(value[i], itemSchema, `${path || "root"}[${i}]`);
-				if (err) return err;
-			}
-		}
-		return null;
-	}
-	if (schema.type === "string") {
-		if (typeof value !== "string") return `${path || "root"} must be a string`;
-		return null;
-	}
-	if (schema.type === "number") {
-		if (typeof value !== "number") return `${path || "root"} must be a number`;
-		return null;
-	}
-	if (schema.type === "integer") {
-		if (typeof value !== "number" || !Number.isInteger(value)) return `${path || "root"} must be an integer`;
-		return null;
-	}
-	if (schema.type === "boolean") {
-		if (typeof value !== "boolean") return `${path || "root"} must be a boolean`;
-		return null;
-	}
-	return null;
-	}
-
-	import * as detMath from "../det/math.js";
-
 import * as detEd25519 from "../det/ed25519.js";
-import * as det from "../det/index.js";
 import * as esbuild from "esbuild";
+import { validateSchema } from "./schema.js";
+import { extractString, extractCommands, extractStringMap } from "./extract.js";
 
+// ── Types ───────────────────────────────────────────────────────
 
 /** Context passed to all program code (handlers, actor actions, ticks). */
 export interface ProgramContext {
@@ -195,15 +128,6 @@ export interface ProgramDef {
 	actor?: ProgramActorDef;
 	validator?: ValidatorFn;
 	validatedTypes?: string[];
-	/**
-		/**
-		 * If `true`, every type in `validatedTypes` is a chain-mode type:
-		 * the kernel requires `authExtension` on every Change and verifies the
-		 * signature before the program's validator runs. Direct mutations
-		 * (setField, addBlock, etc.) on chain-mode objects are rejected;
-		 * callers must construct a signed Change and submit via pushChanges.
-		 */
-		chainMode?: boolean;
 }
 
 /** A loaded program ready for dispatch. */
@@ -232,71 +156,6 @@ export interface ProgramActorInstance {
 interface ModuleSet {
 	entry: string;
 	modules: Map<string, string>; // filename → source
-}
-
-// ── Field extraction helpers ────────────────────────────────────
-
-/** Extract a plain string from a proto field (raw string or Value wrapper). */
-function extractString(field: unknown): string | undefined {
-	if (field == null) return undefined;
-	if (typeof field === "string") return field;
-	if (typeof field === "object" && "stringValue" in (field as any)) {
-		return (field as any).stringValue as string;
-	}
-	return undefined;
-}
-
-/** Extract a commands map from a field (plain object or proto ValueMap). */
-function extractCommands(field: unknown): Record<string, string> {
-	if (field == null) return {};
-	if (typeof field === "object" && "mapValue" in (field as any)) {
-		const entries = (field as any).mapValue?.entries;
-		if (!entries || typeof entries !== "object") return {};
-		const result: Record<string, string> = {};
-		for (const [key, val] of Object.entries(entries)) {
-			const s = extractString(val);
-			if (s !== undefined) result[key] = s;
-		}
-		return result;
-	}
-	if (typeof field === "object") {
-		const result: Record<string, string> = {};
-		for (const [key, val] of Object.entries(field as Record<string, unknown>)) {
-			const s = typeof val === "string" ? val : extractString(val);
-			if (s !== undefined) result[key] = s;
-		}
-		return result;
-	}
-	return {};
-}
-
-/** Extract a string→string map from a ValueMap field. */
-function extractStringMap(field: unknown): Map<string, string> {
-	const result = new Map<string, string>();
-	if (field == null) return result;
-	if (typeof field === "object" && "mapValue" in (field as any)) {
-		const entries = (field as any).mapValue?.entries;
-		if (entries && typeof entries === "object") {
-			for (const [key, val] of Object.entries(entries)) {
-				const s = extractString(val);
-				if (s !== undefined) result.set(key, s);
-			}
-		}
-	}
-	return result;
-}
-
-/** Extract a string array from a ValueList field. */
-function extractStringArray(field: unknown): string[] {
-	if (field == null) return [];
-	if (Array.isArray(field)) return field.filter(v => typeof v === "string");
-	if (typeof field === "object" && "listValue" in (field as any)) {
-		const items = (field as any).listValue?.values;
-		if (Array.isArray(items)) {
-			return items.map((v: any) => extractString(v)).filter((s): s is string => s !== undefined);
-		}
-	}
-	return [];
 }
 
 // ── Module bundler ──────────────────────────────────────────────
@@ -404,12 +263,9 @@ async function compileModuleProgram(ms: ModuleSet, name: string): Promise<Progra
 		const externals: Record<string, unknown> = {
 			"proto.js": proto,
 			"crypto.js": cryptoMod,
-			"det/canonical.js": detCanonical,
-			"det/math.js": detMath,
 			"det/ed25519.js": detEd25519,
-			"det/index.js": det,
 			"shared.js": sharedMod,
-			"runtime.js": { registerIndexHook, getIndexHook, registerAuthVerifier, getAuthVerifier, getValidator, isChainModeType, registerContentHandler, registerActorContentHandler, getContentHandler },
+			"runtime.js": { registerIndexHook, getIndexHook, registerAuthVerifier, getAuthVerifier, getValidator, registerContentHandler, registerActorContentHandler, getContentHandler },
 		};
 		const factory = new Function(bundled);
 		// Node built-ins go through the real require, scoped to node: prefix only
@@ -495,7 +351,6 @@ async function extractModuleSet(
 // ── Validator registry ──────────────────────────────────────────
 
 const validators = new Map<string, ValidatorFn>();
-const chainModeTypes = new Set<string>();
 
 /** Register a validator for one or more type keys. */
 function registerValidator(typeKeys: string[], fn: ValidatorFn): void {
@@ -504,19 +359,9 @@ function registerValidator(typeKeys: string[], fn: ValidatorFn): void {
 	}
 }
 
-/** Mark each type key as chain-mode (requires signed Changes). */
-function registerChainModeTypes(typeKeys: string[]): void {
-	for (const key of typeKeys) chainModeTypes.add(key);
-}
-
 /** Get the validator for a given type key (if any). */
 export function getValidator(typeKey: string): ValidatorFn | undefined {
 	return validators.get(typeKey);
-}
-
-/** Whether a typeKey participates in chain consensus (signature gate, validator dispatch). */
-export function isChainModeType(typeKey: string): boolean {
-	return chainModeTypes.has(typeKey);
 }
 
 
@@ -541,10 +386,12 @@ export function getIndexHook(typeKey: string): IndexHookFn | undefined {
 
 
 // ── Auth verifier registry ──────────────────────────────────────
+//
+// Generic registry for transport-level signature verifiers (e.g. peer-chat
+// envelope signing). The kernel registers no built-ins; programs that need
+// signing register their own verifier on load.
 
-/** Verifier for a specific auth extension type. Receives the Change and its
- *  payload; returns true if the auth is cryptographically valid.
- *  The canonical bytes (with id and payload zeroed) are computed internally. */
+/** Verifier for a specific auth extension type. Returns true if valid. */
 export type AuthVerifierFn = (change: Change, payload: Uint8Array) => boolean;
 
 const authVerifiers = new Map<string, AuthVerifierFn>();
@@ -558,21 +405,6 @@ export function registerAuthVerifier(type: string, fn: AuthVerifierFn): void {
 export function getAuthVerifier(type: string): AuthVerifierFn | undefined {
 	return authVerifiers.get(type);
 }
-
-
-// Built-in Ed25519 verifier: payload is a serialized Signature message.
-// pubkey, nonce, fee are committed; signature is verified against canonical bytes.
-registerAuthVerifier("ed25519", (change, payload) => {
-	try {
-		const s = decodeSignature(payload);
-		if (!s.pubkey || s.pubkey.length !== 32) return false;
-		if (!s.signature || s.signature.length !== 64) return false;
-		const signingBytes = canonicalEncodeChangeForSigning(change);
-		return ed25519Verify(s.pubkey, signingBytes, s.signature);
-	} catch {
-		return false;
-	}
-});
 
 
 // ── Content handler registry ────────────────────────────────────
@@ -599,56 +431,20 @@ const contentHandlers = new Map<string, ContentHandlerFn>();
 
 /**
  * Register a handler for a content_type string (e.g. "glon/change-bundle").
- *
- * ⚠️  GOTCHA — the handler is invoked from `/transport-router`'s tick with
- *     `/transport-router`'s `ctx`. Any `ctx.state` mutation lands on the
- *     router's state, and `persistIfChanged`-style writes go to the router's
- *     actor — NOT the program you think you're writing for.
- *
- * If your handler MUTATES PERSISTED STATE, prefer `registerActorContentHandler`
- * below — it dispatches into your program's actor for you. Use the raw
- * `registerContentHandler` only for stateless processing (e.g. logging,
- * routing-by-metadata to another program).
+ * Handlers run on the transport-router's ctx — `ctx.state` writes land on
+ * the router, not your program. For state-mutating handlers use
+ * `registerActorContentHandler` below.
  */
 export function registerContentHandler(contentType: string, fn: ContentHandlerFn): void {
 	contentHandlers.set(contentType, fn);
 }
 
 /**
- * Register a content handler that ROUTES THROUGH an actor program's typed
- * action — the only safe shape for handlers that mutate persisted state.
- *
- * On every incoming envelope of `contentType`, the router will call
- * `ctx.dispatchProgram(programPrefix, action, [{ envelope_b64, content_type, from }])`
- * which executes the action with the OWNING program's `ctx.state` and
- * `ctx.programId`, so `persistIfChanged` writes land on the right actor.
- *
- * Requirements on the program side:
- *   - Define a typed action with this input shape:
- *       { envelope_b64: string; content_type?: string; from?: string }
- *   - In the action body, base64-decode envelope_b64, parse JSON, then
- *     update state and call your own persist helper.
- *
- * Example (in your program's actorDef.typedActions):
- *
- *     handleChat: {
- *       inputSchema: { type: "object", required: ["envelope_b64"], properties: {
- *         envelope_b64: { type: "string" },
- *         content_type: { type: "string" },
- *         from: { type: "string" },
- *       }},
- *       handler: async (ctx, input) => {
- *         const body = JSON.parse(Buffer.from(input.envelope_b64, "base64").toString("utf8"));
- *         ctx.state.messages = ctx.state.messages ?? [];
- *         ctx.state.messages.push({ ...body, from: input.from });
- *         await persistIfChanged(ctx.state, ctx);
- *         return true;
- *       },
- *     },
- *
- * And the registration is one line:
- *
- *     registerActorContentHandler("glon/peer-chat", "/peer-chat", "handleChat");
+ * Register a content handler that routes through an actor program's typed
+ * action — the safe shape when the handler must mutate persisted state.
+ * The router calls `dispatchProgram(programPrefix, action, [{ envelope_b64,
+ * content_type, from }])` with the owning program's state. The receiving
+ * action takes `{ envelope_b64, content_type?, from? }`.
  */
 export function registerActorContentHandler(
 	contentType: string,
@@ -835,9 +631,8 @@ export async function loadPrograms(
 	const refs = await store.list("program");
 	const programs: ProgramEntry[] = [];
 
-	// Clear previous validator and chain-mode registrations.
+	// Clear previous validator registrations.
 	validators.clear();
-	chainModeTypes.clear();
 
 	for (const ref of refs) {
 		let obj: any;
@@ -868,9 +663,6 @@ export async function loadPrograms(
 		// Register validator if present
 		if (def.validator && def.validatedTypes?.length) {
 			registerValidator(def.validatedTypes, def.validator);
-		}
-		if (def.chainMode && def.validatedTypes?.length) {
-			registerChainModeTypes(def.validatedTypes);
 		}
 
 		// Build the handler: prefer def.handler, fall back to actor dispatch help text

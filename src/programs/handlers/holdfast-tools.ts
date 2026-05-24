@@ -353,10 +353,6 @@ const BASE_TOOLS: ToolSpec[] = [
 		target_prefix: "/crud",
 		target_action: "addBlock",
 	},
-
-	// x402_authorize + x402_settle tools targeted the now-removed /coin
-	// program. Strip them so newly-bootstrapped agents don't list orphan
-	// tools.
 ];
 
 // ── Memory tools ─────────────────────────────────────────────────

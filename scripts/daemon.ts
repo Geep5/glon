@@ -302,10 +302,6 @@ async function resolveId(raw: string): Promise<string | null> {
 			}
 		}
 
-		// /x402/verify and /x402/settle HTTP routes were removed alongside
-		// the /coin program. Agents previously used them to settle x402
-		// payment authorizations.
-
 		if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
 		let body = "";
 		req.on("data", (c) => { body += c; });

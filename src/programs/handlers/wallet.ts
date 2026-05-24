@@ -1,28 +1,14 @@
-// Wallet — local-only Ed25519 key management and Change signing.
+// Wallet — local-only Ed25519 key management for transport-level signing.
 //
 // Mirrors the storage pattern of /auth: keys live in a flat JSON file
 // under GLON_DATA, mode 0600, written atomically via .tmp + rename. Keys
-// NEVER touch the DAG. Wallet objects are not chain-mode; they're a local
-// utility, like a private keychain.
-//
-// Two responsibilities:
-//   1. Generate, store, list named keypairs.
-	//   2. Sign a Change on behalf of a named key. The wallet receives an
-	//      unsigned Change (without `authExtension`), fills in pubkey/nonce/fee,
-	//      computes canonical signing bytes, signs them, and returns the
-	//      fully-formed signed Change with content-addressed `id` filled in.
-//
-// What the wallet does NOT do:
-	//   - Construct token operations (that's /coin's job)
-//   - Maintain on-chain state (the wallet is local; on-chain identity is
-//     just the raw pubkey)
-//   - Verify signatures (the kernel does that on push)
+// NEVER touch the DAG. The wallet is a local utility, like a private
+// keychain. Other programs (e.g. /peer-chat) request a signature on an
+// arbitrary byte string via the `sign` action.
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
-	import { encodeChange, decodeChange, encodeSignature, type Change, type Signature } from "../../proto.js";
 	import { generateKeyPair, sign as ed25519Sign } from "../../det/ed25519.js";
-	import { canonicalEncodeChange, canonicalEncodeChangeForSigning } from "../../det/canonical.js";
-	import { sha256, hexEncode, hexDecode } from "../../crypto.js";
+	import { hexEncode, hexDecode } from "../../crypto.js";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -153,57 +139,6 @@ function doKeyForPubkey(pubkeyHex: string, path?: string): KeyInfo | null {
 	return null;
 }
 
-// ── Signing ──────────────────────────────────────────────────────
-
-interface SignChangeInput {
-	/** Wallet key name to sign with. */
-	name: string;
-	/** Base64-encoded Change to sign (without authExtension). */
-	changeB64: string;
-}
-
-interface SignChangeResult {
-	/** Base64-encoded fully-formed signed Change with id and signature filled in. */
-	changeB64: string;
-	/** Hex-encoded change id (for caller logging). */
-	id: string;
-	/** Hex-encoded signer pubkey (for caller logging). */
-	pubkey: string;
-}
-
-function doSignChange(input: SignChangeInput, path?: string): SignChangeResult {
-	const file = readWalletFile(path);
-	const entry = file.keys[input.name];
-	if (!entry) throw new Error(`wallet.sign: no key named "${input.name}"`);
-
-	// Decode the unsigned change.
-	const change = decodeChange(new Uint8Array(Buffer.from(input.changeB64, "base64")));
-
-	// Build the signature (pubkey, zeroed sig bytes).
-	const sig: Signature = {
-		pubkey: hexDecode(entry.pubkey),
-		signature: new Uint8Array(64),
-	};
-	const candidate: Change = {
-		...change,
-		authExtension: { type: "ed25519", payload: encodeSignature(sig) },
-	};
-
-	// Compute the bytes the signer commits to: canonical(change with id zeroed and payload zeroed).
-	const signingBytes = canonicalEncodeChangeForSigning(candidate);
-	sig.signature = ed25519Sign(hexDecode(entry.privateKey), signingBytes);
-
-	// Insert final signature, then compute the content-address.
-	candidate.authExtension = { type: "ed25519", payload: encodeSignature(sig) };
-	candidate.id = sha256(canonicalEncodeChange(candidate));
-
-	const encoded = encodeChange(candidate);
-	return {
-		changeB64: Buffer.from(encoded).toString("base64"),
-		id: hexEncode(candidate.id),
-		pubkey: entry.pubkey,
-	};
-	}
 // ── CLI ──────────────────────────────────────────────────────────
 
 const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
@@ -265,7 +200,7 @@ const handler = async (cmd: string, args: string[], ctx: ProgramContext) => {
 				`    ${cyan("wallet list")}                  list keys (no private material shown)`,
 				`    ${cyan("wallet show")} ${dim("<name>")}       show one key's pubkey + creation time`,
 				`    ${cyan("wallet remove")} ${dim("<name>")}     forget a key (no key recovery — back up first)`,
-				dim(`  Signing happens via the actor API; /coin uses it to construct signed Changes.`),
+				dim(`  Programs sign arbitrary bytes via the actor API (action: sign).`),
 				dim(`  Storage: ${walletFilePath()} (mode 0600).`),
 			].join("\n"));
 		}
@@ -297,10 +232,6 @@ const actorDef: ProgramActorDef = {
 		remove: async (_ctx: ProgramContext, name: string, opts?: { path?: string }) => {
 			return doRemove(name, opts?.path);
 		},
-		/** Sign an unsigned Change. Returns { changeB64, id, pubkey }. */
-		signChange: async (_ctx: ProgramContext, input: SignChangeInput, opts?: { path?: string }) => {
-			return doSignChange(input, opts?.path);
-		},
 
 		/** Sign an arbitrary message (base64). Returns { signature: hex, pubkey: hex }. */
 		sign: async (_ctx: ProgramContext, name: string, messageB64: string, opts?: { path?: string }) => {
@@ -325,7 +256,6 @@ export const __test = {
 	doShow,
 	doRemove,
 	doKeyForPubkey,
-	doSignChange,
 	readWalletFile,
 	writeWalletFile,
 	walletFilePath,

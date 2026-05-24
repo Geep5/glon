@@ -32,11 +32,8 @@ import { sha256, hexEncode, hexDecode, generateObjectId } from "./crypto.js";
 import { computeState, findHeads, toSnapshot, getPrimaryContent, type ObjectState, type BlockProvenance } from "./dag/dag.js";
 import { initDisk, writeChange, readChangeByHex, listChangeFilesForObject, deleteChangesForObject, diskStats } from "./disk.js";
 
-	import { decodeSignature } from "./proto.js";
-	import { getValidator, isChainModeType, getIndexHook, getAuthVerifier } from "./programs/runtime.js";
+	import { getValidator, getIndexHook } from "./programs/runtime.js";
 	import type { BatchValidationContext } from "./programs/runtime.js";
-	import { canonicalEncodeChange, canonicalEncodeChangeForSigning } from "./det/canonical.js";
-	import { verify as ed25519Verify } from "./det/ed25519.js";
 import { style } from "./programs/shared.js";
 import {
 	assertPortAvailable,
@@ -133,15 +130,6 @@ function headBytes(c: { vars: ObjectVars }): Uint8Array[] {
 
 /** Write a change to disk, recompute vars from DAG, broadcast. */
 function commitChange(c: any, change: Change): void {
-	// Local mutators (setField, addBlock, etc.) cannot produce signed
-	// Changes — chain-mode objects MUST go through pushChanges with a
-	// pre-built signed Change so the kernel can verify the signature.
-	if (c.vars.typeKey && isChainModeType(c.vars.typeKey)) {
-		throw new Error(
-			`commitChange: object ${c.state.id} has chain-mode type ${c.vars.typeKey}; ` +
-			`use pushChanges with a signed Change instead of direct mutators`,
-		);
-	}
 	writeChange(change);
 	const result = loadFromDisk(c.state.id);
 	if (result) {
@@ -370,47 +358,9 @@ const objectActor = actor({
 			}
 
 
-			// ── Chain-mode auth gate ───────────────────────────────────
-			// Dispatch to registered auth verifiers by extension type.
-			if (effectiveTypeKey && isChainModeType(effectiveTypeKey)) {
-				for (const change of decoded) {
-					if (!change.authExtension) {
-						throw new Error(
-							`auth gate: chain-mode change for object ${change.objectId} is missing authExtension`,
-						);
-					}
-					const verifier = getAuthVerifier(change.authExtension.type);
-					if (!verifier) {
-						throw new Error(
-							`auth gate: no verifier registered for type "${change.authExtension.type}"`,
-						);
-					}
-					const verified = verifier(change, change.authExtension.payload);
-					if (!verified) {
-						throw new Error(`auth gate: invalid auth for change in ${change.objectId}`);
-					}
-
-					// Content-address check: id MUST equal sha256(canonical(change with id zeroed)).
-					const expectedId = sha256(canonicalEncodeChange(change));
-					if (hexEncode(expectedId) !== hexEncode(change.id)) {
-						throw new Error(`auth gate: change id does not match canonical hash`);
-					}
-				}
-			}
-
-
 			const validator = getValidator(effectiveTypeKey);
 			if (validator) {
-				// Extract signer pubkey from first change's auth extension for validator use.
-				let signerPubkey: string | undefined;
-				const firstChange = decoded[0];
-				if (firstChange?.authExtension?.type === "ed25519" && firstChange.authExtension.payload) {
-					try {
-						const sig = decodeSignature(firstChange.authExtension.payload);
-						signerPubkey = Buffer.from(sig.pubkey).toString("hex");
-					} catch { /* ignore — validator will run without signer hint */ }
-				}
-				const context: BatchValidationContext = { allChanges: decoded, signerPubkey };
+				const context: BatchValidationContext = { allChanges: decoded };
 				const result = validator(decoded, context);
 				if (!result.valid) {
 					throw new Error(`Validation rejected: ${result.error}`);
@@ -534,20 +484,6 @@ const storeActor = actor({
 			`);
 			await database.execute("CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_id)");
 			await database.execute("CREATE INDEX IF NOT EXISTS idx_links_relation ON links(relation_key)");
-			await database.execute(`
-				CREATE TABLE IF NOT EXISTS coins (
-					coin_id TEXT NOT NULL,
-					bucket_id TEXT NOT NULL,
-					token_id TEXT NOT NULL,
-					owner_pubkey TEXT NOT NULL,
-					amount TEXT NOT NULL,
-					spent INTEGER NOT NULL DEFAULT 0,
-					created_at INTEGER NOT NULL DEFAULT 0,
-					PRIMARY KEY (coin_id, token_id)
-				)
-			`);
-			await database.execute("CREATE INDEX IF NOT EXISTS idx_coins_token_owner ON coins(token_id, owner_pubkey, spent)");
-			await database.execute("CREATE INDEX IF NOT EXISTS idx_coins_bucket ON coins(bucket_id)");
 		},
 	}),
 
@@ -685,7 +621,6 @@ const storeActor = actor({
 			);
 			await c.db.execute("DELETE FROM changes WHERE object_id = ?", id);
 			await c.db.execute("UPDATE objects SET deleted = 1 WHERE id = ?", id);
-			await c.db.execute("DELETE FROM coins WHERE bucket_id = ?", id);
 			// Clean up disk
 			deleteChangesForObject(id);
 			c.state.objectCount = Math.max(0, c.state.objectCount - 1);
@@ -821,103 +756,6 @@ const storeActor = actor({
 			return null;
 		},
 
-		// ── Coin index queries ───────────────────────────────────
-		coinBalance: async (c, tokenId: string, pubkey: string): Promise<string> => {
-			const rows = (await c.db.execute(
-				"SELECT amount FROM coins WHERE token_id = ? AND owner_pubkey = ? AND spent = 0",
-				tokenId, pubkey,
-			)) as unknown as { amount: string }[];
-			let total = 0n;
-			for (const row of rows) total += BigInt(row.amount);
-			return total.toString();
-		},
-
-		coinHolders: async (c, tokenId: string): Promise<{ pubkey: string; balance: string }[]> => {
-			const rows = (await c.db.execute(
-				"SELECT owner_pubkey as pubkey, amount FROM coins WHERE token_id = ? AND spent = 0",
-				tokenId,
-			)) as unknown as { pubkey: string; amount: string }[];
-			const balances = new Map<string, bigint>();
-			for (const row of rows) {
-				const prev = balances.get(row.pubkey) ?? 0n;
-				balances.set(row.pubkey, prev + BigInt(row.amount));
-			}
-			const result = Array.from(balances.entries()).map(([pubkey, balance]) => ({ pubkey, balance: balance.toString() }));
-			result.sort((a, b) => {
-				const na = BigInt(a.balance);
-				const nb = BigInt(b.balance);
-				if (na < nb) return 1;
-				if (na > nb) return -1;
-				return 0;
-			});
-			return result;
-		},
-
-		coinStats: async (c): Promise<Record<string, { totalSupply: string; holders: number; buckets: number }>> => {
-			const rows = (await c.db.execute(
-				"SELECT token_id, amount, owner_pubkey, bucket_id FROM coins WHERE spent = 0",
-			)) as unknown as { token_id: string; amount: string; owner_pubkey: string; bucket_id: string }[];
-			const byToken = new Map<string, { totalSupply: bigint; holders: Set<string>; buckets: Set<string> }>();
-			for (const row of rows) {
-				let entry = byToken.get(row.token_id);
-				if (!entry) {
-					entry = { totalSupply: 0n, holders: new Set(), buckets: new Set() };
-					byToken.set(row.token_id, entry);
-				}
-				entry.totalSupply += BigInt(row.amount);
-				entry.holders.add(row.owner_pubkey);
-				entry.buckets.add(row.bucket_id);
-			}
-			const result: Record<string, { totalSupply: string; holders: number; buckets: number }> = {};
-			for (const [tokenId, entry] of byToken) {
-				result[tokenId] = {
-					totalSupply: entry.totalSupply.toString(),
-					holders: entry.holders.size,
-					buckets: entry.buckets.size,
-				};
-			}
-			return result;
-		},
-		coinSelect: async (c, tokenId: string, pubkey: string, minAmount?: string): Promise<{ coin_id: string; bucket_id: string; amount: string }[]> => {
-			const rows = (await c.db.execute(
-				"SELECT coin_id, bucket_id, amount FROM coins WHERE token_id = ? AND owner_pubkey = ? AND spent = 0",
-				tokenId, pubkey,
-			)) as unknown as { coin_id: string; bucket_id: string; amount: string }[];
-			rows.sort((a, b) => {
-				const na = BigInt(a.amount);
-				const nb = BigInt(b.amount);
-				if (na < nb) return 1;
-				if (na > nb) return -1;
-				return 0;
-			});
-			if (!minAmount) return rows;
-			let sum = 0n;
-			const selected: typeof rows = [];
-			for (const row of rows) {
-				selected.push(row);
-				sum += BigInt(row.amount);
-				if (sum >= BigInt(minAmount)) break;
-			}
-			return selected;
-		},
-
-		rebuildCoinIndex: async (c) => {
-			await c.db.execute("DELETE FROM coins");
-			const refs = (await c.db.execute(
-				"SELECT id FROM objects WHERE type_key = ? AND deleted = 0",
-				"chain.coin.bucket",
-			)) as unknown as { id: string }[];
-
-			for (const ref of refs) {
-				const result = loadFromDisk(ref.id);
-				if (result) {
-					const hook = getIndexHook(result.state.typeKey);
-					if (hook) await hook(c, result.state);
-				}
-			}
-			return { rebuilt: refs.length };
-		},
-
 		graphQuery: async (c, rootId: string, depth: number, relationKey?: string): Promise<any[]> => {
 			const visited = new Set<string>();
 			const result: any[] = [];
@@ -973,7 +811,7 @@ const storeActor = actor({
 				allChanges.push(...decoded);
 			}
 
-			// For each group: resolve typeKey, run signature gate.
+			// Resolve typeKey per object (for validator lookup).
 			const typeKeyMap = new Map<string, string>();
 			for (const [objectId, changes] of groupMap) {
 				let effectiveTypeKey = "";
@@ -999,34 +837,6 @@ const storeActor = actor({
 					throw new Error(`pushChangesBatch: cannot resolve typeKey for object ${objectId}`);
 				}
 				typeKeyMap.set(objectId, effectiveTypeKey);
-
-				// Signature gate
-				if (isChainModeType(effectiveTypeKey)) {
-					for (const change of changes) {
-						if (!change.authExtension || change.authExtension.type !== "ed25519") {
-							throw new Error(`signature gate: chain-mode change for object ${change.objectId} is missing ed25519 authExtension`);
-						}
-						const sig = decodeSignature(change.authExtension.payload);
-						if (!sig.pubkey || sig.pubkey.length === 0) {
-							throw new Error(`signature gate: chain-mode change for object ${change.objectId} is missing pubkey`);
-						}
-						if (sig.pubkey.length !== 32) {
-							throw new Error(`signature gate: pubkey must be 32 bytes (got ${sig.pubkey.length})`);
-						}
-						if (!sig.signature || sig.signature.length !== 64) {
-							throw new Error(`signature gate: signature must be 64 bytes (got ${sig.signature?.length ?? 0})`);
-						}
-						const signingBytes = canonicalEncodeChangeForSigning(change);
-						const ok = ed25519Verify(sig.pubkey, signingBytes, sig.signature);
-						if (!ok) {
-							throw new Error(`signature gate: invalid signature for change in ${change.objectId}`);
-						}
-						const expectedId = sha256(canonicalEncodeChange(change));
-						if (hexEncode(expectedId) !== hexEncode(change.id)) {
-							throw new Error(`signature gate: change id does not match canonical hash`);
-						}
-					}
-				}
 			}
 
 			// Run validators with full batch context.
@@ -1035,16 +845,7 @@ const storeActor = actor({
 				const effectiveTypeKey = typeKeyMap.get(objectId)!;
 				const validator = getValidator(effectiveTypeKey);
 				if (validator) {
-					// Extract signer pubkey from first change's auth extension.
-					let signerPubkey: string | undefined;
-					const firstChange = changes[0];
-					if (firstChange?.authExtension?.type === "ed25519" && firstChange.authExtension.payload) {
-						try {
-							const sig = decodeSignature(firstChange.authExtension.payload);
-							signerPubkey = Buffer.from(sig.pubkey).toString("hex");
-						} catch { /* ignore */ }
-					}
-					const result = validator(changes, { ...batchContext, signerPubkey });
+					const result = validator(changes, batchContext);
 					if (!result.valid) {
 						throw new Error(`Validation rejected for ${objectId}: ${result.error}`);
 					}

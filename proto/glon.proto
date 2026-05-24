@@ -46,26 +46,13 @@ message Change {
   // The DAG of ops remains canonical; snapshots just let us skip prefix replay.
   ObjectSnapshot snapshot = 7;  // optional state checkpoint (speeds up replay)
 
-	  // Generic auth extension for extensible authentication.
-	  // The type field selects a registered verifier; the payload is opaque
-	  // to the kernel and interpreted by the verifier.
-	  AuthExtension auth_extension = 22;
-
-	}
-message X402Auth {
-  bytes  nonce       = 1;  // 32-byte unique nonce
-  int64  valid_after  = 2; // unix seconds (inclusive)
-  int64  valid_before = 3; // unix seconds (exclusive)
+  // Field 22 was AuthExtension (chain-mode); removed in the chain-mode strip.
+  reserved 22;
+  reserved "auth_extension";
 }
 
-message AuthExtension {
-  string type = 1;
-  bytes payload = 2;
-}
-
-	// Ed25519 signature. For authExtension type "ed25519", the payload contains
-	// an encoded Signature. The signing bytes zero `id` and the signature bytes
-	// inside the payload; pubkey IS included (the signer commits to it).
+// Ed25519 signature container. Used by transport-level signing
+// (e.g. /peer-chat envelopes). Not part of the DAG.
 message Signature {
   bytes  pubkey    = 1;    // 32-byte Ed25519 public key
   bytes  signature = 2;    // 64-byte Ed25519 signature
