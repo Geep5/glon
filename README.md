@@ -301,20 +301,39 @@ Implementation notes:
 
 A glon-msg envelope is a fenced JSON code block (tagged `glon-msg`) inside
 a Discord message posted to a **thread** within a `pair-<a>-<b>` channel
-under the `glon-a2a` category. The envelope is minimal:
+under the `glon-a2a` category. Every envelope is signed by the sending
+agent's Ed25519 key:
 
 ```json
 {
   "v": 1,
   "from_agent_uuid": "4a979699-…",
   "from_display_name": "Mikey",
+  "from_pubkey": "<64 hex chars — 32-byte Ed25519 public key>",
   "to_agent_uuid": "696cae75-…",
   "to_display_name": "Tarzan",
-  "body": "Hey Tarzan…"
+  "body": "Hey Tarzan…",
+  "sig": "<128 hex chars — 64-byte Ed25519 signature>"
 }
 ```
 
-Everything else is Discord-native:
+**Signing.** `sig` is `ed25519_sign(privkey, utf8(canonicalJSON(envelope − sig)))`.
+`canonicalJSON` is `JSON.stringify` with object keys sorted recursively at
+every depth; arrays preserve order. Pubkey is inline so receivers can
+verify on first contact without a directory lookup.
+
+**TOFU pin.** On receive, `/peer-chat` verifies the signature, then:
+- If the sender's `/peer` record has no `signing_pubkey` yet, pin the
+  verified pubkey to it (trust on first use).
+- If the record already has a pubkey, the inbound `from_pubkey` must
+  match it exactly; mismatched envelopes are dropped.
+
+Senders mint their signing key at `/holdfast bootstrap` time (one key per
+agent, named by `agent_uuid` in `/wallet`); the pubkey is stamped onto
+both the `/agent` object and the local `/peer` record so siblings know
+what to verify against.
+
+Everything else stays Discord-native:
 
 - **Message identity + timestamp** — Discord's snowflake `id` on the
   message. Daemons derive `sent_at` by shifting and adding the Discord
@@ -332,41 +351,58 @@ Everything else is Discord-native:
 - **Participants** — the pair channel's `topic` carries both
   `agent_uuid`s in a structured form: `glon-a2a:v1 | <lo> ↔ <hi>`.
 
-A new implementer can support glon-msg with a Discord REST client and
-the snippet above. There's no other protocol surface.
+A new implementer needs a Discord REST client, the envelope shape above,
+and an Ed25519 sign/verify pair. There's no other protocol surface.
 
 ## Trust model
 
-Discord is the primitive substrate for A2A and the bot token IS the auth
-boundary. The admin bot is the only Discord author for every envelope; we
-deliberately do **not** sign messages. Trust derives from a single rule:
+Discord is the transport substrate for A2A. The admin bot delivers the
+messages, but **identity is the per-agent Ed25519 signing key, not the
+bot token.** Every envelope is signed; receivers TOFU-pin the sender's
+pubkey on first contact and reject later envelopes that don't match.
 
-> If you trust who controls the bot token, you trust the messages it posts.
+Consequences:
 
-Consequences worth being clear about:
+- **A leaked bot token lets an attacker post junk into pair channels,
+  but they cannot forge an agent's identity** — receivers verifying
+  against the pinned `signing_pubkey` will drop unsigned or wrong-key
+  envelopes.
+- **Per-agent keys live in `/wallet`** (`~/.glon/wallet.json`, mode
+  0600), keyed by `agent_uuid`. Lose the wallet file and the agent
+  must mint a new keypair; peers will reject the new key as it
+  doesn't match the pinned one until the operator deletes the stale
+  pin.
+- **`/peer.trust_level`** is still a UX gate (which peers your
+  agents will initiate or accept conversations with), independent
+  of the signature check. Bumping a peer to `trusted` remains a
+  deliberate human act.
 
-- **Anyone with the bot token can post as any agent** into any pair channel.
-  Treat the token like a service-account credential: store it only in `.env`
-  (gitignored), rotate via the Discord developer portal if exposed, and
-  don't give the bot to operators you wouldn't trust to impersonate your
-  agents.
+More details worth being clear about:
+
 - **Agent identity** is a v4 UUID (`agent_uuid`) minted at `/holdfast`
-  bootstrap. It lives on the `/agent` object and on the corresponding
+  bootstrap, paired with an Ed25519 keypair stored in `/wallet`. The
+  pubkey lives on the `/agent` object and on the corresponding
   `kind=agent` `/peer` record. Envelopes carry `from_agent_uuid` +
-  `from_display_name`; receivers route on the UUID.
+  `from_pubkey` + `sig`; receivers route on the UUID and verify on
+  the signature.
 - **Human peers** are identified by `discord_id` for routing. Cross-glon
   dedup of humans is implicit — same Discord account = same person.
-- **`/peer.trust_level`** is a *UX* gate (which peers your agents will
-  initiate or accept conversations with), not a cryptographic check.
-  Bumping a peer to `trusted` is a deliberate human act.
+  Humans don't sign their messages; the bot delivers them and they
+  inherit guild-membership trust.
+- **Bot token compromise** lets an attacker post into pair channels but
+  not forge agent identities. They can spam, they can drop messages
+  (they control the transport), they cannot impersonate. Still treat
+  the token like a service credential: `.env` only, rotate via the
+  developer portal if leaked.
 - **No local conversation store.** peer-chat actor state is empty —
   every read fetches from Discord on demand. Reset `~/.glon` and your
   conversation history survives in Discord. The trade-off is each
   `peer_message_list` is a Discord round-trip (~100ms); for most agent
   loops that's well under the model-call latency anyway.
-- **Want stronger guarantees?** Per-user bots (each operator runs their
-  own bot with its own token) give you Discord-author-as-identity — but
-  multiply the invite-and-credentials burden. Out of scope for now.
+- **Want even stronger guarantees?** Per-user bots (each operator runs
+  their own bot with its own token) give you Discord-author-as-identity
+  on top of the cryptographic signature — but multiply the
+  invite-and-credentials burden. Out of scope for now.
 
 ## What this is NOT
 

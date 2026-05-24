@@ -47,6 +47,11 @@ import { dim, bold, cyan, red, green, yellow, magenta } from "../shared.js";
 		 *  the `agent_id` link on the peer object — set for kind=agent records
 		 *  whose agent lives on THIS daemon, absent for remote-agent peers. */
 		agent_object_id?: string;
+		/** Hex-encoded 32-byte Ed25519 public key for kind=agent records.
+		 *  Used to verify the signature on inbound peer-chat envelopes. TOFU-
+		 *  pinned on first verified contact for remote agents; set at bootstrap
+		 *  for local agents. */
+		signing_pubkey?: string;
 		discord_id?: string;
 		email?: string;
 		notes?: string;
@@ -76,7 +81,7 @@ export function isPeered(trust_level: string | undefined | null): boolean {
 // the read path but preserved on disk.
 //   agent_object_id is NOT in this list — it's not a settable string field
 //   but a derived value read from the `agent_id` link on the peer object.
-	const PEER_FIELDS = ["display_name", "kind", "trust_level", "agent_uuid", "discord_id", "email", "notes", "last_seen", "host_peer_id"] as const;
+	const PEER_FIELDS = ["display_name", "kind", "trust_level", "agent_uuid", "signing_pubkey", "discord_id", "email", "notes", "last_seen", "host_peer_id"] as const;
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -102,6 +107,7 @@ function extractString(v: any): string | undefined {
 			trust_level: extractString(fields?.trust_level) ?? "stranger",
 			agent_uuid: extractString(fields?.agent_uuid),
 			agent_object_id: extractLinkTarget(fields?.agent_id),
+			signing_pubkey: extractString(fields?.signing_pubkey),
 			discord_id: extractString(fields?.discord_id),
 			email: extractString(fields?.email),
 			notes: extractString(fields?.notes),

@@ -703,6 +703,26 @@ async function doSetup(opts: SetupOpts, ctx: ProgramContext): Promise<SetupResul
 		}
 	}
 
+	// Ensure this agent has an Ed25519 signing key in /wallet (keyed by
+	// agent_uuid) and that its pubkey is stamped onto the /agent object.
+	// Used to sign peer-chat envelopes for transport-level auth.
+	let signingPubkey = extractString((await store.get(agentId))?.fields?.signing_pubkey);
+	if (!signingPubkey && agentUuid) {
+		try {
+			const existingKey = await ctx.dispatchProgram("/wallet", "show", [agentUuid]) as { pubkey?: string } | null;
+			if (existingKey?.pubkey) {
+				signingPubkey = existingKey.pubkey;
+			} else {
+				const created = await ctx.dispatchProgram("/wallet", "new", [agentUuid]) as { pubkey: string };
+				signingPubkey = created.pubkey;
+			}
+			const agentActor = client.objectActor.getOrCreate([agentId]);
+			await agentActor.setField("signing_pubkey", JSON.stringify(stringVal(signingPubkey)));
+		} catch (err: any) {
+			ctx.print?.(dim(`  [holdfast] wallet key setup failed (${err?.message ?? String(err)}); agent will send unsigned envelopes`));
+		}
+	}
+
 	// Self peer (the principal): reuse any peer with kind=self, else create.
 	// The principal is identified by discord_id for routing; cross-glon
 	// dedup of humans happens implicitly via that Discord identity.
@@ -739,14 +759,18 @@ async function doSetup(opts: SetupOpts, ctx: ProgramContext): Promise<SetupResul
 			agent_uuid: stringVal(agentUuid),
 			agent_id: linkVal(agentId, "agent"),
 		};
+		if (signingPubkey) agentPeerFields.signing_pubkey = stringVal(signingPubkey);
 		await store.create("peer", JSON.stringify(agentPeerFields));
 	} else {
-		// Back-patch agent_uuid onto an older /peer record that pre-dates
-		// the cleanup. Idempotent: setField just rewrites the same value.
+		// Back-patch agent_uuid / signing_pubkey onto older /peer records.
+		// Idempotent: setField just rewrites the same value.
 		const existing = await store.get(agentPeerId);
+		const peerActor = client.objectActor.getOrCreate([agentPeerId]);
 		if (!extractString(existing?.fields?.agent_uuid) && agentUuid) {
-			const peerActor = client.objectActor.getOrCreate([agentPeerId]);
 			await peerActor.setField("agent_uuid", JSON.stringify(stringVal(agentUuid)));
+		}
+		if (!extractString(existing?.fields?.signing_pubkey) && signingPubkey) {
+			await peerActor.setField("signing_pubkey", JSON.stringify(stringVal(signingPubkey)));
 		}
 	}
 

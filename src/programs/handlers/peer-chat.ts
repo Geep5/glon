@@ -17,11 +17,19 @@
 // on both ends.
 //
 // Wire envelope (v1):
-//   { v, from_agent_uuid, from_display_name, to_agent_uuid, to_display_name, body }
-// Everything else is derived from the surrounding Discord message + thread.
+//   { v, from_agent_uuid, from_display_name, from_pubkey, to_agent_uuid,
+//     to_display_name, body, sig }
+// from_pubkey is hex-encoded 32-byte Ed25519 public key; sig is hex-encoded
+// 64-byte Ed25519 signature over canonical-JSON(envelope minus sig).
+// Receivers TOFU-pin from_pubkey to the sender's /peer record on first
+// verified contact and reject subsequent envelopes whose from_pubkey or
+// signature does not match. Everything else is derived from the surrounding
+// Discord message + thread.
 
 import type { ProgramDef, ProgramContext, ProgramActorDef } from "../runtime.js";
 import { dim, bold, cyan, green, red, yellow } from "../shared.js";
+import { verify as ed25519Verify } from "../../det/ed25519.js";
+import { hexEncode, hexDecode } from "../../crypto.js";
 
 const PEER_TRUSTED_LEVELS = new Set(["trusted", "friend", "family", "self"]);
 function isPeered(trust_level: string | undefined | null): boolean {
@@ -52,10 +60,60 @@ interface A2AEnvelope {
 	v: 1;
 	from_agent_uuid: string;
 	from_display_name: string;
+	/** Hex-encoded 32-byte Ed25519 pubkey of the sender. Set by signEnvelope. */
+	from_pubkey?: string;
 	to_agent_uuid: string;
 	to_display_name: string;
 	body: unknown;
 	originated_from?: OriginatedFrom;
+	/** Hex-encoded 64-byte Ed25519 signature over canonical JSON of the
+	 *  envelope with `sig` removed. Set by signEnvelope. */
+	sig?: string;
+}
+
+// ── Envelope signing helpers ────────────────────────────────────
+
+/** Canonical JSON: sort all object keys recursively. Used as the byte
+ *  string both signer and verifier hash. Arrays preserve order. */
+function canonicalJSON(value: unknown): string {
+	return JSON.stringify(value, function (_key, v) {
+		if (v && typeof v === "object" && !Array.isArray(v)) {
+			const sorted: Record<string, unknown> = {};
+			for (const k of Object.keys(v as Record<string, unknown>).sort()) {
+				sorted[k] = (v as Record<string, unknown>)[k];
+			}
+			return sorted;
+		}
+		return v;
+	});
+}
+
+/** Sign an envelope in place: dispatches to /wallet for the signature,
+ *  fills `from_pubkey` and `sig`. Throws if the sender's wallet key is
+ *  missing. */
+async function signEnvelope(ctx: ProgramContext, agentUuid: string, env: A2AEnvelope): Promise<void> {
+	const { sig: _drop, ...envWithoutSig } = env;
+	const bytes = Buffer.from(canonicalJSON(envWithoutSig), "utf8");
+	const result = await ctx.dispatchProgram("/wallet", "sign", [agentUuid, bytes.toString("base64")]) as { signature: string; pubkey: string };
+	env.from_pubkey = result.pubkey;
+	env.sig = result.signature;
+}
+
+/** Verify an envelope's signature. Returns the recovered pubkey hex on
+ *  success, throws on any failure (missing fields, malformed lengths,
+ *  bad sig). Receivers should TOFU-pin the returned pubkey to /peer. */
+function verifyEnvelopeSignature(env: A2AEnvelope): string {
+	if (!env.sig) throw new Error("envelope missing sig");
+	if (!env.from_pubkey) throw new Error("envelope missing from_pubkey");
+	const pubkeyBytes = hexDecode(env.from_pubkey);
+	if (pubkeyBytes.length !== 32) throw new Error(`from_pubkey must be 32 bytes (got ${pubkeyBytes.length})`);
+	const sigBytes = hexDecode(env.sig);
+	if (sigBytes.length !== 64) throw new Error(`sig must be 64 bytes (got ${sigBytes.length})`);
+	const { sig: _drop, ...envWithoutSig } = env;
+	const bytes = new Uint8Array(Buffer.from(canonicalJSON(envWithoutSig), "utf8"));
+	const ok = ed25519Verify(pubkeyBytes, bytes, sigBytes);
+	if (!ok) throw new Error("ed25519 verify failed");
+	return hexEncode(pubkeyBytes);
 }
 
 export interface PeerMessage {
@@ -235,6 +293,7 @@ async function doStartConversation(ctx: ProgramContext, input: StartConversation
 			original_request: input.originated_from.original_request ? String(input.originated_from.original_request).slice(0, 500) : undefined,
 		};
 	}
+	await signEnvelope(ctx, sender.agent_uuid, envelope);
 	const posted = await ctx.dispatchProgram("/discord", "postToThread", [{
 		thread_id: thread.thread_id,
 		envelope,
@@ -279,6 +338,7 @@ async function doSend(ctx: ProgramContext, input: SendInput): Promise<{ msg_id: 
 		to_display_name: peer_display_name,
 		body: input.text,
 	};
+	await signEnvelope(ctx, sender.agent_uuid, envelope);
 	const posted = await ctx.dispatchProgram("/discord", "postToThread", [{
 		thread_id: input.conversation_id,
 		envelope,
@@ -308,16 +368,18 @@ async function doEndConversation(ctx: ProgramContext, input: EndConversationInpu
 	const reason = (input.reason ?? "").toString().slice(0, 200) || "no reason given";
 	try {
 		const { peer_agent_uuid, peer_display_name } = await getPeerForThread(ctx, input.conversation_id, sender.agent_uuid);
+		const envelope: A2AEnvelope = {
+			v: 1,
+			from_agent_uuid: sender.agent_uuid,
+			from_display_name: sender.display_name,
+			to_agent_uuid: peer_agent_uuid,
+			to_display_name: peer_display_name,
+			body: `[conversation done] ${reason}`,
+		};
+		await signEnvelope(ctx, sender.agent_uuid, envelope);
 		await ctx.dispatchProgram("/discord", "postToThread", [{
 			thread_id: input.conversation_id,
-			envelope: {
-				v: 1,
-				from_agent_uuid: sender.agent_uuid,
-				from_display_name: sender.display_name,
-				to_agent_uuid: peer_agent_uuid,
-				to_display_name: peer_display_name,
-				body: `[conversation done] ${reason}`,
-			},
+			envelope,
 		}]);
 	} catch (err: any) {
 		ctx.print?.(dim(`[peer-chat] endConversation: final-message post failed (${err?.message ?? err}); locking anyway`));
@@ -385,6 +447,30 @@ async function doHandleA2A(ctx: ProgramContext, input: HandleA2AInput): Promise<
 	if (!isPeered(effectiveTrust)) {
 		ctx.print?.(dim(`[peer-chat] dropped inbound: sender ${senderPeer.display_name} at trust=${senderPeer.trust_level}`));
 		return { processed: false, reason: "sender not peered" };
+	}
+
+	// Signature gate. Discord-as-transport is not an auth boundary — every
+	// envelope must carry a valid Ed25519 signature from the sender's
+	// signing key. The pubkey is TOFU-pinned to the /peer record on the
+	// first valid contact; later envelopes must match the pinned value.
+	let verifiedPubkey: string;
+	try {
+		verifiedPubkey = verifyEnvelopeSignature(env);
+	} catch (err: any) {
+		ctx.print?.(dim(`[peer-chat] dropped inbound from ${senderPeer.display_name}: ${err?.message ?? String(err)}`));
+		return { processed: false, reason: `invalid signature: ${err?.message ?? "unknown"}` };
+	}
+	const pinnedPubkey = (senderPeer.signing_pubkey ?? "").toLowerCase();
+	if (!pinnedPubkey) {
+		// First contact — pin the verified pubkey for future comparison.
+		try {
+			await ctx.dispatchProgram("/peer", "setField", [senderPeer.id, "signing_pubkey", verifiedPubkey]);
+		} catch (err: any) {
+			ctx.print?.(dim(`[peer-chat] TOFU-pin of ${senderPeer.display_name} pubkey failed: ${err?.message ?? err}`));
+		}
+	} else if (pinnedPubkey !== verifiedPubkey.toLowerCase()) {
+		ctx.print?.(dim(`[peer-chat] dropped inbound from ${senderPeer.display_name}: pubkey ${verifiedPubkey.slice(0, 12)}… does not match pinned ${pinnedPubkey.slice(0, 12)}…`));
+		return { processed: false, reason: "pubkey does not match pinned signing_pubkey" };
 	}
 
 	// Look up the conversation's delegation context, if any. We do this for
@@ -789,4 +875,5 @@ export default program;
 export const __test = {
 	doStartConversation, doSend, doEndConversation, doResumeConversation,
 	doHandleA2A, doListConversations, doListMessages, doStatus,
+	canonicalJSON, signEnvelope, verifyEnvelopeSignature,
 };
